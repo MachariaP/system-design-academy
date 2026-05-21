@@ -1,387 +1,299 @@
 # Module 2: Database Architectures & Scaling
 
-Databases are where system design stops being abstract.
+Databases are where system design becomes real.
 
-Traffic can be retried. Stateless services can be cloned. Queues can buffer spikes. But storage has memory, ordering, durability, ownership, and correctness. Scaling a database means choosing where data lives, how many copies exist, when replicas agree, and what the system does when the network lies.
+Stateless services can be cloned. Queues can buffer. Caches can absorb reads. But storage has memory, ordering, ownership, durability, and correctness. Scaling a database means deciding where data lives, how replicas agree, what happens during network partitions, and which invariants cannot be broken.
 
-This chapter explains how storage layers evolve from a single relational database into globally distributed systems inspired by classic designs such as **Amazon Dynamo** and the **Google File System (GFS)**.
+This module is a definitive reference for distributed storage trade-offs, combining relational scaling, sharding, consistent hashing, Dynamo-style availability, GFS-style separation of control/data planes, and modern hot-partition lessons.
 
 ---
 
 ## Learning Goals
 
-By the end of this module, you should be able to:
-
 | Skill | What You Should Be Able To Explain |
 |---|---|
-| **CAP and partition behavior** | Why packet loss forces a choice between consistency and availability |
-| **RDBMS scaling** | How replication, federation, and sharding change read/write behavior |
-| **Replication lag** | Why users can read stale data after a successful write |
-| **Consistent hashing** | How a hash ring reduces resharding when nodes join or leave |
-| **ACID vs. BASE** | Why relational and NoSQL systems optimize for different guarantees |
-| **Dynamo-style availability** | How sloppy quorums, hinted handoff, and vector clocks handle failure |
-| **GFS-style throughput** | Why separating metadata from data flow unlocks massive file throughput |
+| **SQL vs. NoSQL choice** | How consistency, joins, access patterns, and write volume drive storage choice |
+| **Replication lag** | Why read replicas can return stale data after a successful write |
+| **Sharding** | How shard keys shape query locality, hotspots, and operational complexity |
+| **Consistent hashing** | Why virtual nodes reduce rebalancing and smooth ownership |
+| **Dynamo-style AP storage** | Sloppy quorum, hinted handoff, vector clocks, and semantic reconciliation |
+| **GFS architecture** | Why metadata control and bulk data flow are separated |
+| **Hot partition handling** | How poor partition keys and skewed access patterns break otherwise scalable systems |
 | **SQL tuning** | How indexing, data types, partitioning, and denormalization affect performance |
 
 ---
 
-## 1. The Distributed Storage Reality
+## 1. Master Decision Tree: Should I Use SQL Or NoSQL?
 
-Distributed databases are not one database. They are a group of machines attempting to behave like one database while messages between them can be delayed, duplicated, reordered, or dropped.
+```mermaid
+flowchart TD
+    Start["Start: What does the data need?"]
+    Txn["Do you need multi-row ACID transactions<br/>or strict invariants?"]
+    Joins["Do you need rich joins and ad hoc queries?"]
+    WriteScale["Is write volume too high for one primary<br/>or one vertical SQL cluster?"]
+    Access["Are access patterns known and key-based?"]
+    Global["Do you need global low-latency writes?"]
+    NewSQLFit["Can you pay coordination latency<br/>for distributed SQL semantics?"]
+    SQL["Traditional SQL<br/>Postgres/MySQL"]
+    SQLScale["SQL + replicas + partitioning<br/>then shard/federate carefully"]
+    NoSQL["NoSQL / Dynamo-style KV or wide-column"]
+    NewSQL["NewSQL<br/>Spanner/CockroachDB-style"]
+    Search["Specialized index/search store"]
 
-That is the heart of distributed storage: **the network is part of the database**.
+    Start --> Txn
+    Txn -->|"Yes"| Joins
+    Txn -->|"No"| Access
+    Joins -->|"Yes"| WriteScale
+    Joins -->|"No, mostly key-value"| Access
+    WriteScale -->|"No"| SQL
+    WriteScale -->|"Yes"| NewSQLFit
+    NewSQLFit -->|"Yes"| NewSQL
+    NewSQLFit -->|"No"| SQLScale
+    Access -->|"Yes, predictable key access"| Global
+    Access -->|"No, search/ranking/text"| Search
+    Global -->|"Yes, availability over immediate consistency"| NoSQL
+    Global -->|"No"| SQLScale
+```
 
-### CAP At The Packet Level
+> 🧠 **Staff-engineer note**  
+> The correct database is usually not "SQL vs NoSQL." It is "which invariants must be enforced synchronously, and which views can be rebuilt asynchronously?"
 
-The **CAP theorem** says that when a distributed system experiences a **network partition**, it cannot simultaneously guarantee both:
+---
 
-- **Consistency**: every read sees the latest committed write.
-- **Availability**: every request to a non-failing node receives a non-error response.
+## 2. Distributed Storage Reality: CAP And PACELC
 
-**Partition tolerance** is not optional in real distributed systems. Links fail. Switches misroute packets. Firewalls drop traffic. Datacenters become temporarily unreachable.
+In a distributed database, replicas communicate over a network that can drop, delay, duplicate, or reorder packets. During a **network partition**, one replica may be unable to verify whether another replica has accepted a newer write.
 
-Imagine two replicas:
-
-| Replica | Local State |
-|---|---|
-| `db-a` | User balance = `$100` |
-| `db-b` | User balance = `$100` |
-
-Now a client writes `balance = $50` to `db-a`, but packets between `db-a` and `db-b` are dropping.
-
-If another client reads from `db-b`, the system has two legal choices:
-
-| Choice | Behavior | CAP Position |
+| Choice During Partition | Behavior | Trade-Off |
 |---|---|---|
-| **Refuse or wait** | `db-b` cannot prove it has the latest value, so it times out or returns an error | **CP**: preserve consistency, sacrifice availability |
-| **Answer locally** | `db-b` returns `$100` because that is its local value | **AP**: preserve availability, accept stale reads |
+| **Consistency over availability** | Refuse or wait until the system can prove the latest value | Correct but may time out |
+| **Availability over consistency** | Answer using local state | Responsive but may be stale |
 
-The engineer does not get to choose "no partition." The engineer chooses what the system does **during** the partition.
-
-### PACELC In One Sentence
-
-**PACELC** extends CAP:
+**PACELC** extends the lesson:
 
 - If there is a **Partition**, choose **Availability or Consistency**.
 - **Else**, during normal operation, choose **Latency or Consistency**.
 
-This matters because consistency costs do not disappear when the network is healthy. Synchronous replication, quorum reads, and cross-region coordination can increase latency even on a normal day.
-
 ---
 
-## 2. Dynamo-Style AP Systems
-
-Amazon Dynamo was designed for high availability in customer-facing workloads where rejecting writes could directly harm the user experience.
-
-Its bias is clear: **accept writes whenever possible, reconcile later when necessary**.
-
-### Eventual Consistency
-
-In an **eventually consistent** system, replicas are allowed to diverge temporarily.
-
-The promise is not "every read immediately sees the latest write." The promise is: if no new updates occur and replicas can communicate, they will eventually converge.
-
-This model is useful when:
-
-- Writes must stay available during partial failures.
-- The application can tolerate temporary inconsistency.
-- Conflicts can be repaired automatically or with domain-specific merge logic.
-
-### Sloppy Quorums
-
-A strict quorum writes to the designated replica set for a key.
-
-A **sloppy quorum** writes to the first healthy nodes it can reach, even if some are not the ideal owners for that key.
-
-Example:
-
-| Concept | Example |
-|---|---|
-| Replication factor | `N = 3` |
-| Write quorum | `W = 2` |
-| Read quorum | `R = 2` |
-| Ideal owners | `A`, `B`, `C` |
-| Partitioned node | `A` is unreachable |
-| Sloppy write targets | `B`, `C`, and temporary node `D` |
-
-The write succeeds because enough reachable nodes accepted it, even though one ideal owner was unavailable.
-
-### Hinted Handoff
-
-**Hinted handoff** makes sloppy quorum durable.
-
-If node `A` should receive a replica but is down, node `D` can temporarily store that replica with a hint saying, "This belongs to `A`."
-
-When `A` recovers:
-
-1. `D` detects that `A` is healthy again.
-2. `D` forwards the hinted data to `A`.
-3. `A` stores the missed update.
-4. `D` deletes the temporary hinted copy.
-
-This improves write availability without pretending that every replica was up to date at write time.
-
-### Vector Clocks And Conflict Versions
-
-Dynamo uses **vector clocks** to track causality between versions.
-
-A vector clock records the version history from multiple writers or nodes. It helps answer:
-
-- Did version `X` happen before version `Y`?
-- Did version `Y` overwrite `X`?
-- Or are `X` and `Y` concurrent conflicting versions?
-
-If two versions are concurrent, the database may return both to the application. The application then performs reconciliation.
-
-### Syntactic vs. Semantic Reconciliation
-
-| Reconciliation Type | Meaning | Example |
-|---|---|---|
-| **Syntactic reconciliation** | The system resolves versions mechanically using metadata | "This vector clock dominates that one, so keep the newer causally-descended version" |
-| **Semantic reconciliation** | The application resolves conflict using business meaning | "Two shopping carts diverged; merge the item sets instead of discarding one cart" |
-
-For a shopping cart, semantic reconciliation is often better. If one replica has `["book"]` and another has `["pen"]`, the correct user experience may be `["book", "pen"]`, not last-write-wins.
-
----
-
-## 3. SQL Scaling And The Cost Of Consistency
-
-Relational databases begin as a beautiful abstraction: normalized tables, transactions, indexes, and SQL.
-
-Scaling them forces a question: **which part of the database abstraction are you willing to weaken?**
-
-### Scaling Matrix
+## 3. Storage Architecture Performance Matrix
 
 | Architecture | Throughput | Write Latency | Data Consistency | Complexity |
 |---|---|---|---|---|
-| **RDBMS Replication: Master-Slave** | High read throughput through replicas; write throughput limited by one primary | Low to moderate for primary writes; replicas apply changes asynchronously or semi-synchronously | Strong on primary; replicas may be stale due to replication lag | Moderate: failover, replica promotion, read routing |
-| **RDBMS Master-Master** | Higher write availability if writes can be distributed | Higher because conflicts or coordination must be handled | Difficult: concurrent writes can conflict unless carefully partitioned | High: conflict resolution, global ordering, split-brain risk |
-| **Federation** | Good when domains are independent; each service/database scales separately | Usually local to one functional database | Strong within a domain; cross-domain consistency is harder | High: cross-database joins, distributed transactions, ownership boundaries |
-| **Sharding** | High read and write throughput when shard key distributes load evenly | Low for single-shard writes; higher for cross-shard operations | Strong within a shard; cross-shard transactions are expensive | Very high: shard key design, rebalancing, routing, hotspots |
-| **NoSQL / Dynamo-Style** | Very high horizontal throughput | Low when accepting local or quorum writes | Often eventual or tunable consistency | High: conflict resolution, operational tuning, data model constraints |
+| **RDBMS Master-Slave** | High reads via replicas; writes limited by primary | Low to moderate on primary | Strong on primary; replicas can lag | Moderate: failover, read routing |
+| **RDBMS Master-Master** | Higher write availability when partitioned by ownership | Higher due to conflict handling or coordination | Hard, concurrent writes may conflict | High: conflict resolution, split-brain risk |
+| **Federation** | Good when domains scale independently | Local to one functional database | Strong within domain, weaker across domains | High: cross-domain workflows |
+| **Sharding** | High if shard key distributes load | Low for single-shard writes, high for cross-shard writes | Strong within shard, hard across shards | Very high: routing, rebalancing, hotspots |
+| **NoSQL / Dynamo-style** | Very high horizontal throughput | Low when accepting local/quorum writes | Eventual or tunable consistency | High: reconciliation and data modeling |
+| **NewSQL** | High horizontal scale for SQL workloads | Higher than local SQL due to consensus/clock coordination | Strong distributed transactions | High: operational and latency complexity |
+
+**NewSQL difference:** systems such as Spanner and CockroachDB aim to preserve SQL and ACID semantics across distributed nodes, usually by using consensus and carefully managed replication. They reduce application-level sharding pain, but coordination latency is still real.
 
 ---
 
-## 4. RDBMS Scaling Patterns
+## 4. Replication Lag And Read-After-Write Bugs
 
-### Master-Slave Replication
+Master-slave replication scales reads by copying primary writes to read replicas. The cost is **replication lag**.
 
-In **master-slave replication**, one primary database accepts writes. Replica databases copy the primary's write stream and serve reads.
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as Application
+    participant P as Primary DB
+    participant R as Read Replica
 
-| Benefit | Cost |
-|---|---|
-| Scales read-heavy workloads | Writes remain bottlenecked on the primary |
-| Enables read replicas close to users | Replicas can lag behind |
-| Supports failover by promoting a replica | Promotion requires careful correctness checks |
-
-### Replication Lag
-
-**Replication lag** is the delay between a write committing on the primary and becoming visible on a replica.
-
-It can happen because:
-
-- The primary is producing writes faster than replicas can apply them.
-- Network links are slow or congested.
-- Replicas replay changes sequentially.
-- Long-running queries on replicas interfere with apply speed.
-
-### Read-After-Write Failure
-
-If a user writes to the primary and immediately reads from a lagging replica, they may not see their own update.
-
-Example:
-
-1. User updates profile name to `Amina`.
-2. Primary commits successfully.
-3. Read router sends the next request to a replica.
-4. Replica is 2 seconds behind.
-5. User still sees the old name.
-
-This violates **read-your-writes consistency**.
-
-Mitigations:
-
-| Mitigation | How It Helps |
-|---|---|
-| **Read own writes from primary** | Route a user's immediate post-write reads to the primary |
-| **Session stickiness** | Keep a session on a replica known to have caught up |
-| **Replica lag tracking** | Send reads only to replicas below a lag threshold |
-| **Version tokens** | Client carries the last seen commit timestamp or log sequence number |
-| **Synchronous replication** | Wait for replicas before acknowledging writes, trading latency for consistency |
-
-### Master-Master Replication
-
-In **master-master replication**, multiple databases accept writes and replicate to each other.
-
-This can improve write availability, but it introduces conflict risk.
-
-| Conflict Type | Example |
-|---|---|
-| Same-row conflict | Two regions update the same account email at the same time |
-| Uniqueness conflict | Two writers insert the same unique username |
-| Ordering conflict | Two financial operations arrive in different orders |
-
-Master-master is safest when writes are naturally partitioned, such as region-owned tenants or user-owned records.
-
-### Federation
-
-**Federation** splits a database by business function.
-
-Example:
-
-| Database | Owns |
-|---|---|
-| `users_db` | Accounts, profiles, credentials |
-| `orders_db` | Orders, carts, payments |
-| `catalog_db` | Products, inventory, pricing |
-
-Federation reduces coupling and lets teams scale domains independently. The cost is that joins across domains become application-level workflows or asynchronous data pipelines.
-
-### Sharding
-
-**Sharding** splits one logical dataset across multiple physical databases using a shard key.
-
-Examples:
-
-- `user_id`
-- `tenant_id`
-- `account_id`
-- `region_id`
-
-Good shard keys have:
-
-- High cardinality
-- Even distribution
-- Query locality
-- Low risk of a single key becoming too hot
-
-Bad shard keys create hotspots. A celebrity profile, enterprise tenant, or viral post can overload one shard while the rest of the fleet is idle.
-
----
-
-## 5. Consistent Hashing
-
-Traditional modulo sharding often uses:
-
-```text
-shard = hash(key) % number_of_shards
+    U->>API: Update display_name = "Amina"
+    API->>P: COMMIT write at LSN=500
+    P-->>API: Success
+    API-->>U: 200 OK
+    Note over P,R: Replica has only replayed to LSN=470
+    U->>API: Refresh profile immediately
+    API->>R: SELECT profile
+    R-->>API: Old display_name
+    API-->>U: Stale read
+    P-->>R: Replication catches up to LSN=500
 ```
 
-This breaks badly when the number of shards changes.
+### Mitigations
 
-If you move from 10 shards to 11 shards, most keys map to different shards. That creates a **resharding storm**: huge data movement, cache invalidation, replica rebuilds, and operational risk.
+| Technique | How It Works |
+|---|---|
+| **Read own writes from primary** | For a short window after writes, route that user's reads to primary |
+| **Version token / LSN token** | Client carries last committed version; router chooses only caught-up replicas |
+| **Replica lag tracking** | Remove lagging replicas from read pool |
+| **Session consistency** | Keep user reads on a replica known to have observed the write |
+| **Synchronous replication** | Wait for replicas before acking, trading latency for consistency |
 
-**Consistent hashing** maps both nodes and keys onto a fixed hash ring.
+---
 
-To locate a key:
+## 5. Data Modeling For Sharding
 
-1. Hash the key.
-2. Place it on the ring.
-3. Walk clockwise.
-4. The first node encountered is the coordinator for that key.
+Sharding is not just splitting rows. It is choosing the ownership model for your data.
 
-When a node joins, only the keys in its new segment move. The rest of the ring stays stable.
+### Common Shard Keys
 
-### Consistent Hashing Ring Diagram
+| Shard Key | Good For | Risk |
+|---|---|---|
+| **user_id** | User-owned profiles, posts, settings, timelines | Celebrity or enterprise users can become hot |
+| **tenant_id** | B2B SaaS isolation and billing ownership | Large tenants can dominate one shard |
+| **geo_region** | Compliance, latency, regional data boundaries | Poor distribution for global products |
+| **object_id hash** | Even distribution for independent objects | Cross-object queries become expensive |
+| **time bucket** | Logs, events, metrics, retention windows | Current bucket can become hot |
+| **composite key** | `tenant_id + hash(entity_id)` balances locality and spread | Query routing is more complex |
+
+### How To Choose A Shard Key
+
+A good shard key should:
+
+- Have high cardinality.
+- Distribute writes evenly.
+- Match common query filters.
+- Avoid cross-shard joins for the hottest paths.
+- Avoid concentrating all traffic for one customer, celebrity, or region.
+- Support rebalancing without rewriting the application.
+
+### Bad Choice Example: `country` For A Global Social Network
+
+`country` seems intuitive, but it is usually poor:
+
+- A few countries dominate traffic.
+- Users travel and use VPNs.
+- Social graph edges cross countries.
+- One viral event can heat one country partition.
+- The key has low cardinality, so it cannot scale horizontally enough.
+
+> ⚠️ **Failure mode**  
+> A shard key can evenly distribute rows but still fail to distribute traffic. Always model request rate per key, not only storage per key.
+
+---
+
+## 6. Sharding Hotspot: Celebrity Key
+
+```mermaid
+flowchart LR
+    Requests["Millions of requests<br/>profile:celebrity-123"]
+    Router["Shard Router<br/>hash(user_id)"]
+
+    subgraph Shards["Database Shards"]
+        S1["Shard 1<br/>10% CPU"]
+        S2["Shard 2<br/>12% CPU"]
+        S3["Shard 3<br/>99% CPU<br/>celebrity-123 lives here"]
+        S4["Shard 4<br/>8% CPU"]
+    end
+
+    Requests --> Router
+    Router --> S3
+    Router -. ordinary users .-> S1
+    Router -. ordinary users .-> S2
+    Router -. ordinary users .-> S4
+
+    style S3 fill:#fee2e2,stroke:#dc2626
+    style S1 fill:#ecfdf5,stroke:#059669
+    style S2 fill:#ecfdf5,stroke:#059669
+    style S4 fill:#ecfdf5,stroke:#059669
+```
+
+### Hotspot Mitigations
+
+| Technique | Use When |
+|---|---|
+| **Read replicas for hot shard** | Hot key is read-heavy |
+| **Cache hot object** | Same object read repeatedly |
+| **Split logical key** | Comments, counters, likes can be bucketed |
+| **Dedicated shard / tenant isolation** | One tenant or celebrity dominates |
+| **Adaptive partitioning** | Storage engine can split hot ranges/items |
+| **Rate limits and backpressure** | Protect system while rebalancing |
+
+---
+
+## 7. Consistent Hashing And Virtual Nodes
+
+Consistent hashing maps both keys and nodes onto a fixed ring. A key belongs to the first node encountered while walking clockwise.
+
+### Ring With Virtual Nodes And Key Movement
 
 ```mermaid
 flowchart TB
-    Ring["Hash Space Ring<br/>0 ... 2^128 - 1"]
+    Ring["Hash Ring<br/>0 ... 2^128 - 1"]
 
-    subgraph Physical["Physical Database Nodes"]
-        A["db-a"]
-        B["db-b"]
-        C["db-c"]
+    subgraph Before["Before: 3 Physical Nodes With Virtual Nodes"]
+        A1["• A#1 token 08"]
+        B1["• B#1 token 22"]
+        C1["• C#1 token 39"]
+        A2["• A#2 token 57"]
+        C2["• C#2 token 74"]
+        B2["• B#2 token 91"]
     end
 
-    subgraph Virtual["Virtual Nodes / Tokens"]
-        A1["hash(db-a#1)<br/>token 12"]
-        B1["hash(db-b#1)<br/>token 25"]
-        C1["hash(db-c#1)<br/>token 41"]
-        A2["hash(db-a#2)<br/>token 58"]
-        C2["hash(db-c#2)<br/>token 73"]
-        B2["hash(db-b#2)<br/>token 91"]
+    subgraph Keys["Keys"]
+        K1["key user:42 token 18<br/>owned by B#1"]
+        K2["key order:9 token 63<br/>owned by C#2"]
+        K3["key cart:7 token 96<br/>wraps to A#1"]
     end
 
-    subgraph Keys["User Keys"]
-        K1["hash(user:42)<br/>token 18"]
-        K2["hash(order:900)<br/>token 66"]
-        K3["hash(user:7)<br/>token 96"]
+    subgraph Join["Node D Joins"]
+        D1["• D#1 token 16"]
+        D2["• D#2 token 67"]
     end
 
     Ring --> A1 --> B1 --> C1 --> A2 --> C2 --> B2 --> Ring
+    K1 -->|"clockwise before join"| B1
+    K2 -->|"clockwise before join"| C2
+    K3 -->|"wrap"| A1
+    D1 -->|"takes range (08,16]"| K1
+    D2 -->|"takes range (57,67]"| K2
 
-    A --> A1
-    A --> A2
-    B --> B1
-    B --> B2
-    C --> C1
-    C --> C2
-
-    K1 -->|"walk clockwise"| B1
-    K2 -->|"walk clockwise"| C2
-    K3 -->|"wrap around clockwise"| A1
-
-    A1 -. owns range .-> B1
-    B1 -. owns range .-> C1
-    C1 -. owns range .-> A2
-    A2 -. owns range .-> C2
-    C2 -. owns range .-> B2
-    B2 -. owns wrap range .-> A1
+    style D1 fill:#fef3c7,stroke:#d97706
+    style D2 fill:#fef3c7,stroke:#d97706
 ```
+
+When node `D` joins, only keys in the ranges it now owns move. The rest of the cluster remains stable.
 
 ### Why Virtual Nodes Matter
 
-If every physical server appears only once on the ring, random placement can create uneven ranges.
-
-**Virtual nodes** solve this by placing each physical node at many positions on the ring.
-
 | Without Virtual Nodes | With Virtual Nodes |
 |---|---|
-| One large token range can overload one server | Many smaller ranges smooth distribution |
-| Adding a node may burden one neighbor | Load transfer is spread across many neighbors |
-| Harder to handle mixed hardware sizes | Stronger machines can receive more virtual nodes |
-| Hotspots are more likely | Hotspots are reduced, though not eliminated |
+| One physical node owns one large random range | Each node owns many small ranges |
+| Load can be uneven | Distribution smooths statistically |
+| Adding a node affects one neighbor heavily | Movement spreads across many neighbors |
+| Heterogeneous hardware is hard | Stronger nodes can get more virtual nodes |
 
 ---
 
-## 6. Production Code Template: Consistent Hashing
-
-This Python implementation uses `hashlib` and an internal sorted array of ring positions. It supports adding nodes, removing nodes, and looking up the coordinator for a key.
+## 8. Production Code: Consistent Hash Ring With Ownership Watch
 
 ```python
 """
-Consistent Hash Ring
-====================
+Consistent Hash Ring with Virtual Nodes
+======================================
 
 Runtime: Python 3.10+
 Dependencies: standard library only
 
-This implementation is designed for teaching and production adaptation:
+Features:
 - Stable hashing with hashlib.sha256
-- Sorted in-memory ring for O(log n) lookups
-- Virtual nodes to smooth key distribution
-- Explicit add/remove operations
-
-In a real database system, the ring membership would be stored in a
-strongly consistent metadata service and rolled out carefully to clients.
+- Virtual nodes for smoother distribution
+- O(log n) lookup using bisect
+- Distribution statistics
+- Text histogram
+- Ownership watch to report which sampled keys move after topology changes
 """
 
 from __future__ import annotations
 
 import bisect
 import hashlib
+import logging
+from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
+
+
+LOGGER = logging.getLogger(__name__)
+MAX_TOKEN = 2**256
 
 
 def stable_hash(value: str) -> int:
-    """Return a stable integer hash for a string.
-
-    Python's built-in hash() is intentionally randomized between processes.
-    Distributed systems need every node and client to compute the same token
-    for the same input, so we use sha256 from hashlib.
-    """
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return int(digest, 16)
 
@@ -394,18 +306,6 @@ class RingEntry:
 
 
 class ConsistentHashRing:
-    """Consistent hash ring with virtual nodes.
-
-    The ring is represented by two structures:
-    - self._tokens: sorted list of integer token positions
-    - self._ring: mapping from token -> RingEntry
-
-    Lookup uses binary search:
-    - Hash the key.
-    - Find the first token >= key hash.
-    - If none exists, wrap to token 0.
-    """
-
     def __init__(self, nodes: Optional[Iterable[str]] = None, replicas: int = 128) -> None:
         if replicas <= 0:
             raise ValueError("replicas must be positive")
@@ -419,66 +319,48 @@ class ConsistentHashRing:
             self.add_node(node)
 
     def add_node(self, node: str) -> None:
-        """Add a physical node and its virtual nodes to the ring."""
-        if not node:
-            raise ValueError("node must be a non-empty string")
+        self._validate_node(node)
         if node in self._nodes:
             return
 
         self._nodes.add(node)
-
         for vnode_id in range(self.replicas):
-            token = stable_hash(f"{node}#{vnode_id}")
-
-            # sha256 collisions are practically impossible, but this keeps
-            # the structure correct even if a collision is ever encountered.
-            while token in self._ring:
-                token = stable_hash(f"{node}#{vnode_id}:collision:{token}")
-
-            entry = RingEntry(token=token, node=node, vnode_id=vnode_id)
+            token = self._unique_token(f"{node}#{vnode_id}")
+            self._ring[token] = RingEntry(token=token, node=node, vnode_id=vnode_id)
             bisect.insort(self._tokens, token)
-            self._ring[token] = entry
 
     def remove_node(self, node: str) -> None:
-        """Remove a physical node and all of its virtual nodes."""
         if node not in self._nodes:
             return
 
         self._nodes.remove(node)
-        tokens_to_remove = [
-            token for token, entry in self._ring.items() if entry.node == node
-        ]
+        doomed = [token for token, entry in self._ring.items() if entry.node == node]
 
-        for token in tokens_to_remove:
+        for token in doomed:
             del self._ring[token]
             index = bisect.bisect_left(self._tokens, token)
             if index < len(self._tokens) and self._tokens[index] == token:
                 self._tokens.pop(index)
 
     def get_node(self, key: str) -> str:
-        """Return the coordinator node for a key."""
         if not self._tokens:
-            raise RuntimeError("cannot look up a key on an empty ring")
+            raise RuntimeError("cannot route key on an empty ring")
 
-        key_token = stable_hash(key)
-        index = bisect.bisect_left(self._tokens, key_token)
-
-        # Wrap around to the first token when the key lands past the final node.
+        token = stable_hash(key)
+        index = bisect.bisect_left(self._tokens, token)
         if index == len(self._tokens):
             index = 0
 
         return self._ring[self._tokens[index]].node
 
     def get_replicas(self, key: str, count: int) -> List[str]:
-        """Return distinct replica nodes for a key by walking clockwise."""
         if count <= 0:
             raise ValueError("count must be positive")
         if count > len(self._nodes):
-            raise ValueError("replica count cannot exceed number of physical nodes")
+            raise ValueError("replica count cannot exceed physical node count")
 
-        key_token = stable_hash(key)
-        index = bisect.bisect_left(self._tokens, key_token)
-
+        token = stable_hash(key)
+        index = bisect.bisect_left(self._tokens, token)
         replicas: List[str] = []
         seen: set[str] = set()
 
@@ -495,352 +377,310 @@ class ConsistentHashRing:
 
         return replicas
 
+    def distribution(self, sample_keys: Sequence[str]) -> Counter[str]:
+        return Counter(self.get_node(key) for key in sample_keys)
+
+    def distribution_percentages(self, sample_keys: Sequence[str]) -> Dict[str, float]:
+        counts = self.distribution(sample_keys)
+        total = sum(counts.values()) or 1
+        return {node: (count / total) * 100 for node, count in sorted(counts.items())}
+
+    def text_histogram(self, sample_keys: Sequence[str], width: int = 40) -> str:
+        percentages = self.distribution_percentages(sample_keys)
+        lines: List[str] = []
+
+        for node, pct in percentages.items():
+            bar = "#" * max(1, round((pct / 100) * width))
+            lines.append(f"{node:>12} | {bar:<{width}} | {pct:6.2f}%")
+
+        return "\n".join(lines)
+
+    def watch_ownership_changes(
+        self,
+        sample_keys: Sequence[str],
+        operation_name: str,
+    ) -> Callable[[], Dict[str, tuple[str, str]]]:
+        before = {key: self.get_node(key) for key in sample_keys}
+
+        def finish() -> Dict[str, tuple[str, str]]:
+            after = {key: self.get_node(key) for key in sample_keys}
+            moved = {
+                key: (before[key], after[key])
+                for key in sample_keys
+                if before[key] != after[key]
+            }
+            LOGGER.info(
+                "ring operation=%s moved_keys=%s total_keys=%s",
+                operation_name,
+                len(moved),
+                len(sample_keys),
+            )
+            return moved
+
+        return finish
+
     def nodes(self) -> List[str]:
         return sorted(self._nodes)
 
+    def _unique_token(self, seed: str) -> int:
+        token = stable_hash(seed)
+        collision = 0
+        while token in self._ring:
+            collision += 1
+            token = stable_hash(f"{seed}:collision:{collision}")
+        return token
+
+    @staticmethod
+    def _validate_node(node: str) -> None:
+        if not node or not node.strip():
+            raise ValueError("node must be a non-empty string")
+
 
 if __name__ == "__main__":
-    ring = ConsistentHashRing(["db-a", "db-b", "db-c"], replicas=64)
+    logging.basicConfig(level=logging.INFO)
 
-    for key in ["user:42", "user:7", "order:900", "tenant:acme"]:
-        coordinator = ring.get_node(key)
-        replicas = ring.get_replicas(key, count=2)
-        print(f"{key} -> coordinator={coordinator}, replicas={replicas}")
+    keys = [f"user:{i}" for i in range(10_000)]
+    ring = ConsistentHashRing(["db-a", "db-b", "db-c"], replicas=128)
 
-    print("Adding db-d...")
+    print("Before adding db-d")
+    print(ring.text_histogram(keys))
+
+    finish_watch = ring.watch_ownership_changes(keys, "add db-d")
     ring.add_node("db-d")
+    moved = finish_watch()
 
-    for key in ["user:42", "user:7", "order:900", "tenant:acme"]:
-        print(f"{key} -> coordinator={ring.get_node(key)}")
+    print("\nAfter adding db-d")
+    print(ring.text_histogram(keys))
+    print(f"\nMoved sampled keys: {len(moved)} / {len(keys)}")
 ```
 
-### Operational Notes
-
-| Concern | Production Guidance |
-|---|---|
-| **Ring ownership** | Store membership in a consistent metadata plane |
-| **Client rollout** | Roll out ring changes gradually to avoid split routing |
-| **Replication** | Place replicas on distinct physical nodes and preferably distinct racks or zones |
-| **Hot keys** | Consistent hashing balances key ranges, not necessarily request volume |
-| **Rebalancing** | Stream only affected token ranges when nodes join or leave |
+> 🧠 **Staff-engineer note**  
+> Consistent hashing balances key ownership, not request rate. A single hot key can still overwhelm one node.
 
 ---
 
-## 7. ACID vs. BASE
+## 9. Dynamo-Style AP Systems
 
-### ACID
+Dynamo-style systems optimize for write availability during failures. They use replication, sloppy quorums, hinted handoff, and conflict reconciliation.
 
-Relational databases are commonly associated with **ACID** transactions.
+### Sloppy Quorum + Hinted Handoff Write Path
 
-| Property | Meaning |
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Coord as Coordinator
+    participant A as Node A<br/>ideal owner
+    participant B as Node B<br/>ideal owner
+    participant Cn as Node C<br/>ideal owner
+    participant D as Node D<br/>temporary healthy node
+
+    C->>Coord: PUT cart:123 = add book
+    Coord->>A: write replica
+    A--xCoord: unreachable
+    Coord->>B: write replica
+    Coord->>Cn: write replica
+    Coord->>D: write with hint: belongs to A
+    B-->>Coord: ack
+    Cn-->>Coord: ack
+    Coord-->>C: success after W=2 acks
+    Note over D,A: Later, A recovers
+    D->>A: hand off hinted write
+    A-->>D: ack
+    D->>D: delete temporary hinted copy
+```
+
+| Mechanism | Purpose |
 |---|---|
-| **Atomicity** | A transaction commits completely or not at all |
-| **Consistency** | A transaction moves the database from one valid state to another |
-| **Isolation** | Concurrent transactions behave as though executed under the chosen isolation model |
-| **Durability** | Once committed, data survives crashes |
+| **Sloppy quorum** | Write to reachable healthy nodes, not only ideal owners |
+| **Hinted handoff** | Temporary node later forwards missed writes to intended owner |
+| **Eventual consistency** | Replicas converge after communication resumes |
+| **Vector clocks** | Detect whether versions are causal descendants or conflicts |
 
-ACID is ideal when correctness depends on strict invariants:
+---
 
-- Payments
-- Inventory deduction
-- Account balances
-- Uniqueness constraints
-- Financial ledgers
+## 10. Vector Clocks: Concrete Cart Conflict
 
-### BASE
+Two clients update the same cart during a partition.
 
-Many NoSQL systems use a **BASE** model.
+### Before Partition
 
-| Property | Meaning |
-|---|---|
-| **Basically Available** | The system tries to answer even during partial failure |
-| **Soft State** | Replicas may change over time as updates propagate |
-| **Eventual Consistency** | Replicas converge if writes stop and communication resumes |
-
-BASE is useful when scale and availability are more important than immediate global agreement:
-
-- Shopping carts
-- Activity feeds
-- Like counts
-- Product recommendations
-- Session-like data that can be repaired or merged
-
-### ACID vs. BASE Design Signal
-
-| Question | ACID Bias | BASE Bias |
+| Version | Cart Items | Vector Clock |
 |---|---|---|
-| Can stale reads cause financial or legal harm? | Yes | No |
-| Must constraints be enforced immediately? | Yes | Not always |
-| Is availability more important than perfect freshness? | Sometimes | Usually |
-| Can conflicts be merged by business logic? | Rarely | Often |
-| Is global write latency acceptable? | Sometimes | Usually no |
+| `V0` | `[]` | `{A: 1}` |
+
+### During Partition
+
+Client 1 writes through node `B`:
+
+| Version | Cart Items | Vector Clock |
+|---|---|---|
+| `V1` | `["book"]` | `{A: 1, B: 1}` |
+
+Client 2 writes through node `C`:
+
+| Version | Cart Items | Vector Clock |
+|---|---|---|
+| `V2` | `["pen"]` | `{A: 1, C: 1}` |
+
+Neither clock dominates the other. `V1` and `V2` are concurrent siblings.
+
+### Reconciliation
+
+| Step | Version | Cart Items | Vector Clock |
+|---|---|---|---|
+| Read after heal | `V1` | `["book"]` | `{A: 1, B: 1}` |
+| Read after heal | `V2` | `["pen"]` | `{A: 1, C: 1}` |
+| Application merge | `V3` | `["book", "pen"]` | `{A: 1, B: 1, C: 1, R: 1}` |
+
+### Application Merge Snippet
+
+```python
+from typing import Dict, Iterable, List, Set
+
+
+VectorClock = Dict[str, int]
+
+
+def dominates(left: VectorClock, right: VectorClock) -> bool:
+    """Return True when left causally includes right."""
+    all_nodes = set(left) | set(right)
+    return all(left.get(node, 0) >= right.get(node, 0) for node in all_nodes)
+
+
+def merge_cart_siblings(siblings: Iterable[dict], resolver_node: str) -> dict:
+    """Merge concurrent shopping-cart siblings using semantic reconciliation."""
+    merged_items: Set[str] = set()
+    merged_clock: VectorClock = {}
+
+    for sibling in siblings:
+        merged_items.update(sibling["items"])
+        for node, counter in sibling["vector_clock"].items():
+            merged_clock[node] = max(merged_clock.get(node, 0), counter)
+
+    # Increment the resolver node to create a new descendant version.
+    merged_clock[resolver_node] = merged_clock.get(resolver_node, 0) + 1
+
+    return {
+        "items": sorted(merged_items),
+        "vector_clock": merged_clock,
+    }
+
+
+siblings = [
+    {"items": ["book"], "vector_clock": {"A": 1, "B": 1}},
+    {"items": ["pen"], "vector_clock": {"A": 1, "C": 1}},
+]
+
+print(merge_cart_siblings(siblings, resolver_node="R"))
+```
+
+> ⚠️ **Failure mode**  
+> Last-write-wins would silently drop either `book` or `pen`. That is unacceptable for carts, balances, permissions, and collaborative editing.
 
 ---
 
-## 8. GFS: Separating Control Flow From Data Flow
+## 11. GFS: Control Plane vs. Data Plane
 
-The **Google File System** was designed for huge files, streaming reads, high aggregate throughput, and failure as a normal condition.
+GFS separates metadata control from bulk data movement.
 
-Its key architectural move is separating **metadata control** from **bulk data movement**.
+| Plane | Component | Responsibility |
+|---|---|---|
+| **Control plane** | Master | Namespace, file-to-chunk mapping, leases, placement |
+| **Data plane** | Chunkservers | Store large chunks and stream bytes |
+| **Client** | GFS client | Asks master for metadata, then reads/writes chunkservers directly |
 
-### GFS Components
+The master does not carry file data. It coordinates. The chunkservers move bytes.
 
-| Component | Responsibility |
-|---|---|
-| **Master** | Stores metadata: namespace, file-to-chunk mapping, chunk locations, leases |
-| **Chunkserver** | Stores fixed-size chunks as local files |
-| **Client** | Asks the master for metadata, then reads/writes directly to chunkservers |
-
-### Why This Scales
-
-The master does not sit in the data path.
-
-Read flow:
-
-1. Client asks the master where a file chunk lives.
-2. Master returns chunkserver locations.
-3. Client caches that metadata.
-4. Client reads directly from the nearest or preferred chunkserver.
-
-Write flow:
-
-1. Client asks the master which chunkserver has the lease for a chunk.
-2. Master identifies primary and secondary replicas.
-3. Client pushes data to chunkservers, often through a pipeline.
-4. Primary orders the mutation.
-5. Secondaries apply it in the same order.
-
-This keeps metadata centralized enough to manage the namespace while keeping high-volume data transfer away from the master.
-
-### GFS Design Lesson
-
-For storage systems, the control plane and data plane should often be separated.
-
-| Plane | Optimized For |
-|---|---|
-| **Control plane** | Metadata correctness, placement, leases, membership |
-| **Data plane** | Throughput, streaming, replication, disk and network saturation |
+Design lesson: keep high-volume data flow away from centralized metadata controllers.
 
 ---
 
-## 9. SQL Tuning Matrices
-
-Scaling is not always horizontal. Many relational systems survive much longer with disciplined schema and query design.
-
-### Tuning Matrix
+## 12. SQL Tuning Matrix
 
 | Technique | Why It Works | Trade-Off |
 |---|---|---|
-| **B-Tree indexes** | Keep keys ordered for efficient lookups, range scans, and joins, usually `O(log n)` | Slower writes because indexes must be updated |
-| **Composite indexes** | Match multi-column query predicates such as `(tenant_id, created_at)` | Useless if column order does not match access patterns |
-| **Covering indexes** | Serve queries directly from the index without table lookup | More storage and write amplification |
-| **Correct data types** | Smaller types improve cache density and reduce I/O | Poor choices require migrations later |
-| **CHAR vs. VARCHAR** | `CHAR` can fit fixed-length values; `VARCHAR` saves space for variable strings | `CHAR` wastes space for variable-length content |
-| **Table partitioning** | Splits large tables by range, hash, or list for pruning and maintenance | Query planner and operational complexity increase |
-| **Denormalization** | Avoids expensive joins by duplicating read-ready data | Writes become slower and consistency repair gets harder |
-
-### Indexing With B-Trees
-
-B-Tree indexes are effective because they keep data sorted in a balanced tree.
-
-They help with:
-
-- Equality lookups
-- Range scans
-- Ordered pagination
-- Join keys
-- Prefix searches on indexed columns
-
-They hurt when:
-
-- Too many indexes amplify every write.
-- Low-cardinality indexes do not filter enough rows.
-- Queries do not match index order.
-
-### Data Type Optimization
-
-Good schema design keeps rows compact.
-
-| Choice | Guidance |
-|---|---|
-| `INT` vs. `BIGINT` | Use only as much range as the domain requires |
-| `CHAR` | Good for truly fixed-length values such as country codes or hashes of fixed display length |
-| `VARCHAR` | Good for variable-length text such as names and emails |
-| `TIMESTAMP` | Prefer native time types over strings |
-| `BOOLEAN` / enums | Prefer compact representation for low-cardinality state |
-
-Smaller rows mean more rows fit in memory pages, caches, and indexes.
-
-### Table Partitioning
-
-Partitioning breaks a large table into smaller physical pieces.
-
-Common strategies:
-
-| Strategy | Example | Useful When |
-|---|---|---|
-| **Range partitioning** | Orders by month | Queries are time-bounded |
-| **Hash partitioning** | Users by hash of `user_id` | Workload needs even distribution |
-| **List partitioning** | Region-specific data | Data has natural categories |
-| **Hot/cold partitioning** | Recent rows separate from archive rows | Recent data dominates queries |
-
-Partitioning is not sharding by itself. It usually remains inside one database system. But it can make pruning, maintenance, backups, and cache behavior much better.
+| **B-tree indexes** | Efficient equality, range, join, and ordering lookups | Slower writes and more storage |
+| **Composite indexes** | Match multi-column access patterns | Column order matters |
+| **Covering indexes** | Serve query from index only | Storage and write amplification |
+| **Correct data types** | Smaller rows improve cache density | Bad choices require migrations |
+| **Table partitioning** | Prunes scans and simplifies retention | Planner and operational complexity |
+| **Denormalization** | Avoids expensive joins | Slower writes and consistency repair |
 
 ### Denormalization Trade-Off
 
-**Denormalization** duplicates data to avoid expensive joins.
-
-Example:
-
-Instead of joining `orders`, `users`, and `addresses` every time an order history page loads, store a read-ready order summary with the user's display name and shipping city.
+Denormalization duplicates data to optimize read paths. It is useful when reads dominate writes, but every update now has multiple copies to maintain.
 
 | Benefit | Cost |
 |---|---|
 | Faster reads | Slower writes |
 | Fewer joins | Duplicate data |
-| Better cache locality | Consistency repair jobs may be needed |
-| Simpler read queries | Update logic becomes more complex |
-
-The core trade-off: **read optimization vs. write degradation**.
+| Better cache locality | Repair jobs may be needed |
+| Simpler read queries | Update logic gets harder |
 
 ---
 
-## 10. Hotspots And Partition Isolation
+## 13. Real-World Case Studies
 
-Consistent hashing distributes keys, but it does not guarantee equal traffic.
+### Instagram-Style Sharding And ID Generation
 
-A single key can become hot.
+Early Instagram architecture discussions popularized a practical pattern: generate IDs that include a timestamp, a shard identifier, and a per-shard sequence. This lets IDs remain roughly time-sortable while encoding where the object belongs.
 
-Example: `profile:celebrity-123` may receive more traffic than thousands of ordinary user profiles combined. If that key maps to one shard, one machine becomes overloaded while the rest of the cluster is calm.
-
-### Hotspot Mechanics
-
-| Layer | Failure Mode |
+| ID Segment | Purpose |
 |---|---|
-| **Shard router** | Sends all requests for the celebrity key to one shard |
-| **Database CPU** | Saturates on repeated reads, writes, indexes, and locks |
-| **Storage** | Disk or SSD queue depth spikes |
-| **Replication** | Followers lag because the hot shard produces too much change volume |
-| **Application** | Threads block waiting for one overloaded partition |
+| Timestamp bits | Sort by creation time without another lookup |
+| Shard ID bits | Route object to owning shard |
+| Sequence bits | Generate many IDs per shard per time unit |
 
-### Fix Strategy
+Design lesson: IDs can be routing metadata, not just identifiers.
 
-| Step | Action | Why It Works |
-|---|---|---|
-| 1 | Put cache in front of the hot object | Absorbs repeated reads before they hit the shard |
-| 2 | Use request coalescing | Prevents many misses from stampeding the database |
-| 3 | Increase replica count for hot ranges | Spreads reads over more copies |
-| 4 | Split hot keys when possible | Breaks one logical hotspot into multiple physical keys |
-| 5 | Move hot partitions to stronger hardware | Buys time during incident response |
-| 6 | Add virtual nodes and rebalance | Smooths future range ownership |
-| 7 | Separate read and write paths | Keeps comments, counters, and profile reads from fighting for one lock path |
+### DynamoDB Adaptive Capacity And Hot Partitions
 
-### Partition Isolation Principle
+AWS DynamoDB documentation describes adaptive capacity as a mechanism that helps tables continue serving uneven access patterns without throttling, as long as traffic stays within table-level and partition-level limits. AWS also documents per-partition limits, so hot partition design still matters.
 
-Good database architecture prevents one partition from damaging the whole fleet.
+| Lesson | Meaning |
+|---|---|
+| Adaptive capacity helps | The database can react to uneven traffic |
+| It is not magic | A single hot key or poor partition key can still limit scale |
+| Model access patterns | Partition keys must spread request volume, not only storage |
+| Watch partition heat | Monitor throttling, consumed capacity, and hot keys |
 
-Partition isolation means:
-
-- Per-shard connection pools
-- Per-shard rate limits
-- Per-shard circuit breakers
-- Bulkheads between hot and normal tenants
-- Independent replica lag tracking
-- Targeted rebalancing instead of global reshuffling
+> 🧠 **Staff-engineer note**  
+> Managed databases can reduce operational burden, but they do not remove data-modeling responsibility.
 
 ---
 
-## Database Mock Challenges
+## 14. Mock Challenges
 
 > **Challenge 1: Celebrity Hotspot On A Sharded Social Network**  
-> A celebrity posts a viral photo. The database is sharded by `user_id`. Within minutes, latency on one shard rises to 10 seconds while other shards are healthy. Explain the underlying mechanics of the failure and provide a step-by-step fix that preserves availability.
+> A celebrity profile lives on one shard. Traffic spikes to millions of reads and comments. Explain why the whole cluster has capacity but the request still fails.
 
 > **Challenge 2: Read-After-Write Bug From Replication Lag**  
-> A user updates their shipping address and immediately refreshes checkout, but the old address appears. The application writes to the primary and reads from replicas. Explain why this happens and design a fix without sending every read in the system to the primary.
+> A user updates their shipping address and immediately refreshes checkout, but the old address appears from a read replica. Design a targeted fix.
 
-> **Challenge 3: Dynamo-Style Conflict During A Network Partition**  
-> A shopping cart service uses an AP key-value store. During a partition, two replicas accept different writes for the same cart. Explain how sloppy quorums, hinted handoff, vector clocks, and semantic reconciliation should work together.
+> **Challenge 3: Dynamo Conflict During Partition**  
+> Two replicas accept different cart updates during a network partition. Explain sloppy quorum, hinted handoff, vector clocks, and semantic reconciliation.
+
 <details><summary>Click for Staff-Engineer Level Answers</summary>
 
-## Challenge 1: Celebrity Hotspot On A Sharded Social Network
+## Challenge 1
 
-The failure is not a lack of total cluster capacity. It is a lack of capacity on the single partition that owns the celebrity key.
+The shard key routed the celebrity's data to one partition. Total cluster capacity is irrelevant because all traffic for the hot key hits the same owner. Fix with caching, read replicas, hot-key splitting, counter buckets, dedicated shards for extreme accounts, and per-shard circuit breakers.
 
-If the system shards by `user_id`, all reads and writes for `celebrity-123` route to the same shard or same small replica group. The shard router is doing exactly what it was designed to do, but the shard key has created a traffic hotspot.
+## Challenge 2
 
-### Mechanics
+The primary committed the write, but the replica had not replayed the log yet. Return a version token or LSN after the write. Route read-your-writes requests only to replicas caught up to that token, or temporarily to the primary for that user/session.
 
-1. The celebrity key hashes to shard `S17`.
-2. Millions of profile reads, photo reads, comments, likes, and counters route to `S17`.
-3. `S17` saturates CPU, disk, lock queues, or connection pools.
-4. Replicas for `S17` fall behind because the write stream is too heavy.
-5. Application threads pile up waiting for `S17`.
-6. Other shards remain underutilized because their key ranges are not hot.
+## Challenge 3
 
-### Staff-Level Fix
-
-First, protect the rest of the system. Add per-shard circuit breakers and rate limits so `S17` cannot exhaust global application connection pools.
-
-Second, absorb reads. Cache the celebrity profile, photo metadata, and rendered read models in Redis, Memcached, or an edge cache. Use request coalescing so one cache miss refreshes the object while other requests wait or receive stale data.
-
-Third, separate traffic types. Profile reads, comments, likes, and counters should not all hit the same write path. Store high-volume counters in a separate counter service or use sharded counter buckets such as `post_id:bucket_id`.
-
-Fourth, increase read replicas for the hot range and route read-only traffic across those replicas. Track replica lag independently so stale replicas are removed from read rotation.
-
-Fifth, split the hot logical key if the access pattern allows it. For example, comments can be partitioned by `post_id + time_bucket` or `post_id + hash(comment_id)`. Like counters can be bucketed and periodically aggregated.
-
-Sixth, improve long-term placement. Use virtual nodes and rebalance token ranges so one physical host does not own too much hot data. For extreme tenants or celebrities, use tenant isolation: move the account to a dedicated partition or dedicated replica group.
-
-The key architectural idea is **partition isolation**. A hot partition should degrade itself, not the entire database fleet.
-
-## Challenge 2: Read-After-Write Bug From Replication Lag
-
-The write commits on the primary, but the read is served by a replica that has not replayed the write yet. The user sees stale data because asynchronous replication provides eventual replica convergence, not immediate read-your-writes consistency.
-
-### Mechanics
-
-1. User submits address update.
-2. Primary commits the new address at log sequence number `LSN=500`.
-3. Replica is currently replayed only through `LSN=470`.
-4. The read router sends checkout refresh to that replica.
-5. The replica returns the old address.
-
-### Staff-Level Fix
-
-Do not send every read to the primary. Use targeted consistency.
-
-Return a version token after the write, such as a commit timestamp or LSN. Store it in the user's session. For subsequent reads that require read-your-writes behavior, route only to replicas that have replayed at least that version. If no replica has caught up within a small timeout, route that user's read to the primary.
-
-Also maintain replica lag metrics in the read router. Replicas above a lag threshold should be removed from latency-sensitive read pools.
-
-For critical checkout flows, use session-based primary reads for a short window after writes, such as 5 to 30 seconds. That protects correctness without moving unrelated users or unrelated pages to the primary.
-
-For less critical pages, show stale-tolerant data with a refresh indicator. The consistency requirement should match the user harm.
-
-The principle is **consistency by workflow**, not one global policy for every query.
-
-## Challenge 3: Dynamo-Style Conflict During A Network Partition
-
-In an AP key-value store, the system accepts writes during partitions to preserve availability. That means conflicting versions can exist.
-
-### Mechanics
-
-Assume the cart key normally replicates to nodes `A`, `B`, and `C`. During a partition, `A` is unreachable from part of the cluster.
-
-A client adds `book` through nodes `B` and `C`. Another client adds `pen` through `A` and a temporary reachable node `D`. Because sloppy quorum is enabled, the system accepts writes on reachable healthy nodes rather than rejecting the operation.
-
-Node `D` stores a hinted handoff record for the replica that belongs to another node. When the partition heals, `D` forwards the hinted update to the intended owner.
-
-Now the system may discover concurrent versions of the cart. Vector clocks show that neither version causally descends from the other.
-
-### Staff-Level Fix
-
-The database should return both sibling versions to the application instead of silently discarding one. For a shopping cart, last-write-wins is usually wrong because it can lose items. The application should perform semantic reconciliation by merging cart item sets, preserving both `book` and `pen` unless business rules say otherwise.
-
-After reconciliation, the application writes the merged cart back with a vector clock that supersedes both conflicting siblings. Future reads can collapse to the merged version.
-
-Sloppy quorums improve write availability because the system can write to reachable substitute nodes. Hinted handoff improves durability and convergence because temporary holders later deliver missed writes to the correct owners.
-
-The staff-level nuance: AP availability moves complexity from the write path into reconciliation. That is acceptable only when the domain has a safe merge strategy.
+Sloppy quorum accepts writes on reachable nodes. Hinted handoff later forwards missed writes to intended owners. Vector clocks detect concurrent siblings. The application merges the cart semantically, writes back a merged version, and avoids last-write-wins data loss.
 
 </details>
+
+---
+
+## References
+
+- [Amazon DynamoDB: Burst and adaptive capacity](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/burst-adaptive-capacity.html)
+- [Amazon DynamoDB warm throughput and partition limits](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/warm-throughput-scenarios.html)
+- [AWS: DynamoDB adaptive capacity handles imbalanced workloads](https://aws.amazon.com/about-aws/whats-new/2019/11/amazon-dynamodb-adaptive-capacity-now-handles-imbalanced-workloads-better-by-isolating-frequently-accessed-items-automatically/)
+- [Instagram sharding and ID generation reference](https://media.postgresql.org/sfpug/instagram_sfpug.pdf)
