@@ -2,219 +2,72 @@
 
 Distributed systems are built on unreliable communication.
 
-Packets can be dropped. Connections can reset. Clocks can drift. Nodes can pause. A service can be healthy from one client and unreachable from another. The job of infrastructure architecture is to make these failures ordinary: detected, bounded, retried, routed around, and never allowed to cascade through the entire platform.
+Packets drop. DNS fails. Leaders pause. Retries synchronize into storms. A dependency can be healthy from one region and unreachable from another. The goal of distributed communication design is not to remove failure; it is to bound it, observe it, and recover without cascading through the platform.
 
-This chapter covers the communication substrate behind high-scale systems: transport protocols, RPC and REST, consensus, fault tolerance, and resilience patterns.
+This module is a practical guide to RPC, serialization, consensus, idempotency, and resilience patterns.
 
 ---
 
 ## Learning Goals
 
-By the end of this module, you should be able to:
-
 | Skill | What You Should Be Able To Explain |
 |---|---|
-| **TCP vs. UDP** | How acknowledgments, ordering, retransmission, and flow control change behavior |
-| **Latency cost** | Why local datacenter calls and global calls have radically different budgets |
-| **RPC vs. REST** | Why internal service calls often use typed binary RPC while public APIs often use REST |
-| **Consensus** | How clusters elect leaders and agree on operation order |
-| **Vector clocks** | How Dynamo-style systems detect concurrent conflicting versions |
-| **Retries** | Why exponential backoff and jitter protect stressed services |
-| **Circuit breakers** | How clients stop cascading failures by failing fast |
-| **Distributed fallacies** | Which assumptions break when software crosses a network boundary |
+| **RPC vs REST** | When to use typed RPC, resource APIs, or persistent streams |
+| **Serialization** | Why binary formats reduce CPU and bandwidth at scale |
+| **gRPC operations** | Deadlines, retries, health checks, interceptors, and error codes |
+| **Raft consensus** | Leader election, terms, heartbeats, and state transitions |
+| **Vector clocks** | Detecting concurrent versions and resolving them semantically |
+| **Idempotency** | Making retries safe without duplicating business effects |
+| **Circuit breakers** | Preventing cascading failures with open/half-open/closed states |
+| **Failure testing** | Simulating latency, loss, partitions, and downstream failure |
 
 ---
 
-## 1. Transport Layer Engines
+## 1. Protocol Matrix: REST, gRPC, And WebSockets
 
-Network protocols define what guarantees an application can assume.
-
-### TCP
-
-**TCP** is connection-oriented and reliable.
-
-Before application data flows, client and server establish a connection. TCP then uses sequence numbers, acknowledgments, checksums, retransmission, and flow control to deliver a byte stream in order.
-
-| Mechanism | Purpose |
-|---|---|
-| **Three-way handshake** | Establishes a connection before data transfer |
-| **Sequence numbers** | Reconstruct ordered byte stream |
-| **Acknowledgments** | Tell sender which bytes arrived |
-| **Retransmission** | Resend lost segments |
-| **Checksums** | Detect corrupted packets |
-| **Flow control** | Prevent sender from overwhelming receiver buffers |
-| **Congestion control** | Reduce pressure when the network path is saturated |
-| **Window sizing** | Controls how much unacknowledged data can be in flight |
-
-TCP is the default choice when correctness requires reliable ordered delivery: HTTP, databases, queues, file transfer, and most RPC systems.
-
-### UDP
-
-**UDP** is connectionless and lightweight.
-
-It sends datagrams without establishing a connection and does not guarantee delivery, ordering, duplicate prevention, or congestion behavior.
-
-| Strength | Cost |
-|---|---|
-| Lower protocol overhead | Packets can be lost |
-| No connection setup | Packets can arrive out of order |
-| Useful for latency-sensitive traffic | Application must handle reliability if needed |
-| Good for custom protocols | Congestion control is not built in |
-
-UDP is appropriate when late data is worse than lost data, or when the application implements its own reliability model. Examples include live voice, gaming, telemetry, DNS, and QUIC-based transports.
-
-### TCP vs. UDP
-
-| Dimension | TCP | UDP |
-|---|---|---|
-| **Connection model** | Connection-oriented | Connectionless |
-| **Delivery** | Reliable | Best effort |
-| **Ordering** | Ordered byte stream | No ordering guarantee |
-| **Acknowledgments** | Built in | Not built in |
-| **Retransmission** | Built in | Application-defined |
-| **Flow control** | Built in | Not built in |
-| **Typical use** | HTTP, gRPC, databases, queues | DNS, streaming media, gaming, telemetry |
-
----
-
-## 2. Latency And Connection Pooling
-
-Latency is bounded by physics, not just code quality.
-
-The System Design Primer's latency numbers make the scale visible:
-
-| Operation | Approximate Cost |
-|---|---:|
-| Memory reference | Nanoseconds |
-| SSD read | Tens to hundreds of microseconds |
-| Round trip inside a datacenter | Hundreds of microseconds to low milliseconds |
-| Cross-continent round trip | Tens to hundreds of milliseconds |
-
-Within a single datacenter, systems can perform many round trips per second. Globally, a request that crosses oceans spends most of its budget waiting for light, routing, queues, and retransmissions.
-
-### Why Connection Pooling Matters
-
-Creating a new TCP connection repeatedly is expensive.
-
-Each fresh connection can require:
-
-- Socket allocation.
-- TCP handshake.
-- TLS handshake if encrypted.
-- Kernel buffers.
-- Congestion window warmup.
-- Application authentication.
-- Server memory and file descriptors.
-
-**Connection pooling** reuses established connections.
-
-| Benefit | Explanation |
-|---|---|
-| **Lower latency** | Avoid repeated handshakes |
-| **Lower CPU** | Reduce TLS and kernel connection churn |
-| **Lower memory pressure** | Bound concurrent open sockets |
-| **Better throughput** | Keep warm connections and congestion windows |
-| **Safer backpressure** | Pool exhaustion naturally limits outbound concurrency |
-
-Connection pools should be sized deliberately. Too small creates queueing. Too large can overload downstream services.
-
----
-
-## 3. Protocol Matrix: REST, gRPC, And WebSockets
-
-| Dimension | REST: JSON over HTTP/1.1 or HTTP/2 | gRPC: Protobuf over HTTP/2 | WebSockets |
+| Dimension | REST: JSON over HTTP | gRPC: Protobuf over HTTP/2 | WebSockets |
 |---|---|---|---|
-| **Serialization Speed** | Moderate; JSON parsing is text-heavy and CPU-expensive at scale | High; Protobuf is compact binary with generated encoders/decoders | Depends on payload; often JSON unless custom binary is used |
-| **Payload Size** | Larger; field names and text encoding add overhead | Smaller; schema-based binary fields reduce bytes on wire | Variable; efficient for continuous messages after handshake |
-| **Stream Capabilities** | Request/response; HTTP/2 can multiplex but REST APIs are usually unary | Native unary, server streaming, client streaming, and bidirectional streaming | Full-duplex persistent stream |
-| **Schema Contract** | Often OpenAPI/JSON Schema, looser by default | Strong `.proto` contract with code generation | Application-defined message protocol |
-| **Browser Friendliness** | Excellent | Limited direct browser support without gateways such as gRPC-Web | Excellent |
-| **Human Debuggability** | High; easy to inspect JSON | Lower; binary payloads require tooling | Medium; depends on message format |
-| **External API Fit** | Strong for public APIs and integrations | Strong for controlled partners or internal APIs with generated clients | Strong for live user-facing sessions |
-| **Internal Service Fit** | Good, especially when simplicity matters | Excellent for high-throughput typed microservices | Good for push, presence, collaboration, live events |
-| **Best Use Cases** | Public APIs, CRUD resources, broad compatibility | Internal microservices, low-latency RPC, streaming service-to-service calls | Chat, multiplayer, dashboards, notifications, collaborative editing |
-
-### Practical Rule
-
-Use **REST** when interoperability and public API ergonomics matter most.
-
-Use **gRPC** when internal performance, typed contracts, streaming, and code generation matter most.
-
-Use **WebSockets** when the client and server both need to send messages over a long-lived connection.
+| **Serialization speed** | Moderate; text parsing costs CPU | High; generated binary encoding | Depends on payload format |
+| **Payload size** | Larger due to field names/text | Smaller due to schema tags | Variable |
+| **Streaming** | Usually request/response | Unary, server/client streaming, bidirectional | Full-duplex long-lived stream |
+| **Browser support** | Excellent | Requires gRPC-Web or gateway | Excellent |
+| **Human debuggability** | High | Lower without tooling | Medium |
+| **Best external use** | Public APIs and integrations | Controlled partner APIs | Live client sessions |
+| **Best internal use** | Simple service APIs | High-throughput typed microservices | Realtime updates, presence, collaboration |
 
 ---
 
-## 4. RPC vs. REST Internals
+## 2. Serialization Format Comparison
 
-### RPC
+| Format | Schema Evolution | Speed | Payload Size | Language Support | Human Readability |
+|---|---|---|---|---|---|
+| **Protobuf** | Strong field-number based evolution | Very high | Very small | Excellent | Low |
+| **Thrift** | Strong IDL evolution | Very high | Very small | Excellent | Low |
+| **Avro** | Strong schema evolution, common in data pipelines | High | Small | Strong in data ecosystems | Low to medium with tooling |
+| **MessagePack** | Schema optional | High | Small | Broad | Low |
+| **JSON** | Flexible but weak contracts | Lower | Larger | Universal | High |
 
-**Remote Procedure Call** makes a remote operation look like a local function call.
-
-The client calls a generated stub. The stub marshals arguments into a request message, sends it over the network, receives a response, and unmarshals the result.
-
-RPC is action-oriented:
-
-```text
-UserService.CreateUser(request)
-InventoryService.ReserveItem(request)
-PaymentService.CapturePayment(request)
-```
-
-### REST
-
-**REST** models the world as resources and uses HTTP verbs to operate on them.
-
-REST is resource-oriented:
-
-```text
-POST   /users
-GET    /users/123
-PATCH  /users/123
-DELETE /users/123
-```
-
-### Why Internal Services Prefer Binary RPC
-
-Big internal systems often choose Protobuf, Thrift, or Avro because they reduce waste at high volume.
-
-| Concern | JSON/REST Cost | Binary RPC Benefit |
-|---|---|---|
-| **Payload size** | Field names and text values repeat in every message | Compact field tags and binary encoding |
-| **CPU cycles** | Text parsing and dynamic object decoding are expensive | Generated encoders/decoders are faster |
-| **Schema drift** | Looser contracts can fail at runtime | Versioned schemas and generated clients catch errors earlier |
-| **Bandwidth** | Larger payloads increase network cost | Smaller payloads improve throughput |
-| **Streaming** | Usually modeled separately | Built into gRPC over HTTP/2 |
-
-REST remains excellent for public APIs because humans, browsers, proxies, API gateways, documentation tools, and third-party integrations understand it well.
-
-### Lesson Plan: RPC vs. REST Operations
-
-| Operation | RPC Abstraction | REST Abstraction |
-|---|---|---|
-| Signup | `POST /signup` | `POST /persons` |
-| Resign | `POST /resign` with `{ "person_id": "1234" }` | `DELETE /persons/1234` |
-| Read a person | `GET /readPerson?person_id=1234` | `GET /persons/1234` |
-| Read a person's items | `GET /readUsersItemsList?person_id=1234` | `GET /persons/1234/items` |
-| Add an item to a person | `POST /addItemToUsersItemsList` with person and item IDs | `POST /persons/1234/items` |
-| Update an item | `POST /modifyItem` with item ID and fields | `PATCH /items/456` or `PUT /items/456` |
-| Delete an item | `POST /removeItem` with item ID | `DELETE /items/456` |
-
-The teaching distinction: RPC exposes **commands**. REST exposes **resources**.
+> 🧠 **Staff-engineer note**  
+> JSON is often the right public API choice. For internal hot paths, the CPU and bandwidth cost of JSON can become a real capacity problem.
 
 ---
 
-## 5. Production Code Template: Async gRPC Service
+## 3. Async gRPC Service Template
 
-The following template shows a production-shaped asynchronous gRPC service in Python.
+The following template shows an async Python gRPC service with:
 
-It includes:
+- `.proto` contract.
+- Unary interceptor for logging and metrics.
+- Health check service.
+- Readiness flag.
+- Robust error handling.
+- Client retry with exponential backoff and deadline propagation.
 
-- A `.proto` definition.
-- Async server handler logic.
-- Deadlines and cancellation awareness.
-- Structured error handling.
-- Basic validation.
-- Graceful shutdown.
+Install:
+
+```bash
+pip install grpcio grpcio-tools grpcio-health-checking
+```
 
 ### `user_profile.proto`
 
@@ -242,6 +95,7 @@ message UpdateDisplayNameRequest {
   string user_id = 1;
   string display_name = 2;
   int64 expected_version = 3;
+  string idempotency_key = 4;
 }
 
 message UpdateDisplayNameResponse {
@@ -251,7 +105,7 @@ message UpdateDisplayNameResponse {
 }
 ```
 
-Generation command:
+Generate stubs:
 
 ```bash
 python -m grpc_tools.protoc \
@@ -264,38 +118,23 @@ python -m grpc_tools.protoc \
 ### `server.py`
 
 ```python
-"""
-Async gRPC User Profile Service
-===============================
-
-Runtime: Python 3.10+
-Dependencies:
-  pip install grpcio grpcio-tools
-
-Generated files expected:
-  user_profile_pb2.py
-  user_profile_pb2_grpc.py
-
-This example uses an in-memory repository to keep the template focused on
-RPC mechanics. Replace UserRepository with a real database implementation
-behind the same async interface.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import signal
+import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Any, Callable, Dict
 
 import grpc
+from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 import user_profile_pb2
 import user_profile_pb2_grpc
 
 
-LOGGER = logging.getLogger("user-profile-service")
+LOGGER = logging.getLogger("user-profile")
 
 
 class NotFoundError(Exception):
@@ -313,55 +152,85 @@ class UserProfile:
     version: int
 
 
-class UserRepository:
-    """Async repository boundary for user profile storage."""
-
+class Metrics:
     def __init__(self) -> None:
-        self._profiles: Dict[str, UserProfile] = {
-            "user-1": UserProfile(user_id="user-1", display_name="Amina", version=1)
+        self.requests: Dict[str, int] = {}
+        self.errors: Dict[str, int] = {}
+        self.latency_seconds: Dict[str, list[float]] = {}
+
+    def record(self, method: str, latency: float, error: str | None) -> None:
+        self.requests[method] = self.requests.get(method, 0) + 1
+        self.latency_seconds.setdefault(method, []).append(latency)
+        if error is not None:
+            key = f"{method}:{error}"
+            self.errors[key] = self.errors.get(key, 0) + 1
+
+
+class LoggingMetricsInterceptor(grpc.aio.ServerInterceptor):
+    def __init__(self, metrics: Metrics) -> None:
+        self._metrics = metrics
+
+    async def intercept_service(self, continuation, handler_call_details):
+        handler = await continuation(handler_call_details)
+        if handler is None or handler.unary_unary is None:
+            return handler
+
+        method = handler_call_details.method
+        original = handler.unary_unary
+
+        async def wrapped(request, context):
+            start = time.perf_counter()
+            error_code = None
+            try:
+                return await original(request, context)
+            except grpc.RpcError as exc:
+                error_code = exc.code().name if exc.code() else "UNKNOWN"
+                raise
+            except Exception:
+                error_code = "INTERNAL"
+                raise
+            finally:
+                latency = time.perf_counter() - start
+                self._metrics.record(method, latency, error_code)
+                LOGGER.info("method=%s latency=%.4fs error=%s", method, latency, error_code)
+
+        return grpc.unary_unary_rpc_method_handler(
+            wrapped,
+            request_deserializer=handler.request_deserializer,
+            response_serializer=handler.response_serializer,
+        )
+
+
+class UserRepository:
+    def __init__(self) -> None:
+        self._profiles = {
+            "user-1": UserProfile("user-1", "Amina", 1),
         }
+        self._idempotency: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
     async def get(self, user_id: str) -> UserProfile:
         async with self._lock:
             profile = self._profiles.get(user_id)
             if profile is None:
-                raise NotFoundError(f"user_id={user_id!r} not found")
+                raise NotFoundError(user_id)
             return profile
 
-    async def update_display_name(
-        self,
-        user_id: str,
-        display_name: str,
-        expected_version: int,
-    ) -> UserProfile:
+    async def update(self, user_id: str, display_name: str, expected_version: int, idempotency_key: str):
         async with self._lock:
+            if idempotency_key in self._idempotency:
+                return self._idempotency[idempotency_key]
+
             profile = self._profiles.get(user_id)
             if profile is None:
-                raise NotFoundError(f"user_id={user_id!r} not found")
-
+                raise NotFoundError(user_id)
             if profile.version != expected_version:
-                raise VersionConflictError(
-                    f"expected version {expected_version}, current version {profile.version}"
-                )
+                raise VersionConflictError(f"expected={expected_version} actual={profile.version}")
 
-            updated = UserProfile(
-                user_id=user_id,
-                display_name=display_name,
-                version=profile.version + 1,
-            )
+            updated = UserProfile(user_id, display_name, profile.version + 1)
             self._profiles[user_id] = updated
+            self._idempotency[idempotency_key] = updated
             return updated
-
-
-def _validate_user_id(user_id: str) -> None:
-    if not user_id or len(user_id) > 128:
-        raise ValueError("user_id must be non-empty and <= 128 characters")
-
-
-def _validate_display_name(display_name: str) -> None:
-    if not display_name or len(display_name) > 80:
-        raise ValueError("display_name must be non-empty and <= 80 characters")
 
 
 class UserProfileService(user_profile_pb2_grpc.UserProfileServiceServicer):
@@ -370,97 +239,80 @@ class UserProfileService(user_profile_pb2_grpc.UserProfileServiceServicer):
 
     async def GetUserProfile(self, request, context):
         try:
-            if not context.time_remaining():
-                await context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            if not request.user_id:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "user_id required")
 
-            _validate_user_id(request.user_id)
             profile = await self._repository.get(request.user_id)
-
             return user_profile_pb2.GetUserProfileResponse(
                 user_id=profile.user_id,
                 display_name=profile.display_name,
                 version=profile.version,
             )
-
-        except ValueError as exc:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
-        except NotFoundError as exc:
-            await context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except NotFoundError:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "user not found")
         except asyncio.CancelledError:
-            LOGGER.info("GetUserProfile cancelled for user_id=%s", request.user_id)
             raise
         except Exception:
-            LOGGER.exception("unexpected GetUserProfile failure")
-            await context.abort(grpc.StatusCode.INTERNAL, "internal server error")
+            LOGGER.exception("GetUserProfile failed")
+            await context.abort(grpc.StatusCode.INTERNAL, "internal error")
 
     async def UpdateDisplayName(self, request, context):
         try:
-            _validate_user_id(request.user_id)
-            _validate_display_name(request.display_name)
+            if not request.user_id or not request.display_name:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "user_id and display_name required")
+            if not request.idempotency_key:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "idempotency_key required")
 
-            if request.expected_version <= 0:
-                raise ValueError("expected_version must be positive")
-
-            profile = await self._repository.update_display_name(
-                user_id=request.user_id,
-                display_name=request.display_name,
-                expected_version=request.expected_version,
+            profile = await self._repository.update(
+                request.user_id,
+                request.display_name,
+                request.expected_version,
+                request.idempotency_key,
             )
-
             return user_profile_pb2.UpdateDisplayNameResponse(
                 user_id=profile.user_id,
                 display_name=profile.display_name,
                 version=profile.version,
             )
-
-        except ValueError as exc:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
-        except NotFoundError as exc:
-            await context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except NotFoundError:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "user not found")
         except VersionConflictError as exc:
             await context.abort(grpc.StatusCode.ABORTED, str(exc))
         except asyncio.CancelledError:
-            LOGGER.info("UpdateDisplayName cancelled for user_id=%s", request.user_id)
             raise
         except Exception:
-            LOGGER.exception("unexpected UpdateDisplayName failure")
-            await context.abort(grpc.StatusCode.INTERNAL, "internal server error")
+            LOGGER.exception("UpdateDisplayName failed")
+            await context.abort(grpc.StatusCode.INTERNAL, "internal error")
 
 
 async def serve() -> None:
     logging.basicConfig(level=logging.INFO)
-
+    metrics = Metrics()
     repository = UserRepository()
-    server = grpc.aio.server(
-        options=[
-            ("grpc.max_receive_message_length", 4 * 1024 * 1024),
-            ("grpc.max_send_message_length", 4 * 1024 * 1024),
-        ]
-    )
 
+    server = grpc.aio.server(interceptors=[LoggingMetricsInterceptor(metrics)])
     user_profile_pb2_grpc.add_UserProfileServiceServicer_to_server(
         UserProfileService(repository),
         server,
     )
 
-    listen_addr = "[::]:50051"
-    server.add_insecure_port(listen_addr)
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+    health_servicer.set("userprofile.v1.UserProfileService", health_pb2.HealthCheckResponse.SERVING)
+
+    server.add_insecure_port("[::]:50051")
 
     stop_event = asyncio.Event()
-
-    def request_shutdown() -> None:
-        LOGGER.info("shutdown requested")
-        stop_event.set()
-
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, request_shutdown)
+        loop.add_signal_handler(sig, stop_event.set)
 
     await server.start()
-    LOGGER.info("gRPC server listening on %s", listen_addr)
-
+    LOGGER.info("gRPC server listening on :50051")
     await stop_event.wait()
-    LOGGER.info("draining gRPC server")
+
+    health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
     await server.stop(grace=10)
 
 
@@ -468,307 +320,314 @@ if __name__ == "__main__":
     asyncio.run(serve())
 ```
 
-### Production Notes
+### `client_retry.py`
 
-| Concern | Guidance |
-|---|---|
-| **Deadlines** | Require clients to set deadlines so calls do not hang forever |
-| **Retries** | Retry only idempotent operations or operations with idempotency keys |
-| **Status codes** | Use precise gRPC status codes for caller behavior |
-| **Message size** | Enforce explicit max send/receive sizes |
-| **Auth** | Use mTLS, service identity, and authorization interceptors |
-| **Observability** | Emit latency histograms, error codes, deadline exceeded counts, and saturation metrics |
+```python
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+import uuid
+
+import grpc
+
+import user_profile_pb2
+import user_profile_pb2_grpc
+
+
+RETRYABLE = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+}
+
+
+async def call_with_retry(call_factory, *, total_deadline_seconds: float, max_attempts: int = 4):
+    deadline_at = time.monotonic() + total_deadline_seconds
+
+    for attempt in range(1, max_attempts + 1):
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("client deadline exhausted before call")
+
+        try:
+            return await call_factory(timeout=remaining)
+        except grpc.aio.AioRpcError as exc:
+            if exc.code() not in RETRYABLE or attempt == max_attempts:
+                raise
+
+            backoff = min(1.0, 0.05 * (2 ** (attempt - 1)))
+            await asyncio.sleep(random.uniform(0, backoff))
+
+
+async def main() -> None:
+    async with grpc.aio.insecure_channel("localhost:50051") as channel:
+        stub = user_profile_pb2_grpc.UserProfileServiceStub(channel)
+        request = user_profile_pb2.UpdateDisplayNameRequest(
+            user_id="user-1",
+            display_name="Amina M.",
+            expected_version=1,
+            idempotency_key=str(uuid.uuid4()),
+        )
+
+        response = await call_with_retry(
+            lambda timeout: stub.UpdateDisplayName(request, timeout=timeout),
+            total_deadline_seconds=3.0,
+        )
+        print(response)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 ---
 
-## 6. Distributed Consensus
+## 4. Raft Leader Election
 
-Consensus lets a cluster agree on state despite node failures.
+Raft nodes are always in one of three states: follower, candidate, or leader.
 
-At its core, consensus answers:
+### State Transition Diagram
 
-- Who is allowed to coordinate writes?
-- In what order should operations be applied?
-- How does the system continue when a node fails?
-- How does it avoid two leaders making conflicting decisions?
+```mermaid
+stateDiagram-v2
+    [*] --> Follower
+    Follower --> Candidate: election timeout expires\nno heartbeat received
+    Candidate --> Leader: receives majority votes
+    Candidate --> Follower: observes higher term leader
+    Candidate --> Candidate: split vote\ntimeout, increment term
+    Leader --> Follower: observes higher term
+    Leader --> Leader: send heartbeats
+```
 
-### Centralized Coordination: GFS
-
-GFS uses a master for metadata and grants leases to primary chunk replicas.
-
-| Component | Role |
-|---|---|
-| **Master** | Maintains metadata and grants leases |
-| **Primary chunk replica** | Orders mutations for a chunk |
-| **Secondary replicas** | Apply mutations in the primary's chosen order |
-
-The master keeps control decisions centralized, while chunkservers move the actual file data.
-
-### Decentralized Coordination: Dynamo
-
-Dynamo avoids a single master. Any eligible node in a key's preference list can coordinate a request.
-
-That improves availability, but concurrent writes can create conflicting versions. Dynamo uses vector clocks to detect whether versions are causally related or concurrent.
-
-### Vector Clocks
-
-A **vector clock** is a set of `(node, counter)` pairs attached to a version.
-
-| Comparison | Meaning |
-|---|---|
-| Clock A is less than or equal to Clock B for every node | A happened before B |
-| Clock B is less than or equal to Clock A for every node | B happened before A |
-| Neither dominates | Versions are concurrent siblings |
-
-If two shopping cart versions are concurrent, the database should not blindly discard one. It can return both versions to the application for semantic reconciliation.
-
----
-
-## 7. Leader Election With Raft
-
-Raft is a consensus algorithm designed to be understandable. It divides nodes into three roles:
-
-| Role | Behavior |
-|---|---|
-| **Follower** | Responds to leaders and candidates |
-| **Candidate** | Requests votes after election timeout |
-| **Leader** | Sends heartbeats and coordinates log replication |
-
-### Leader Election Sequence
+### Election Timeline
 
 ```mermaid
 sequenceDiagram
-    participant N1 as Node 1<br/>Follower
+    participant N1 as Node 1<br/>Leader term=7
     participant N2 as Node 2<br/>Follower
     participant N3 as Node 3<br/>Follower
 
-    Note over N1,N3: Term 7: Node 1 is leader and sends periodic heartbeats
-    N1->>N2: AppendEntries heartbeat(term=7)
-    N1->>N3: AppendEntries heartbeat(term=7)
-    N2-->>N1: Ack
-    N3-->>N1: Ack
-
-    Note over N1: Node 1 fails or becomes unreachable
-    Note over N2,N3: Followers stop receiving heartbeats
-
-    Note over N2: Election timeout fires first
-    N2->>N2: Become Candidate<br/>increment term to 8<br/>vote for self
+    N1->>N2: Heartbeat AppendEntries(term=7)
+    N1->>N3: Heartbeat AppendEntries(term=7)
+    Note over N1: Node 1 crashes
+    Note over N2: election timeout 180ms
+    Note over N3: election timeout 310ms
+    N2->>N2: timeout fires<br/>term=8<br/>state=Candidate<br/>vote for self
     N2->>N1: RequestVote(term=8)
     N2->>N3: RequestVote(term=8)
-
-    N1--xN2: No response
-    N3-->>N2: VoteGranted(term=8)
-
-    Note over N2: Majority reached: N2 + N3
-    N2->>N2: Transition Candidate -> Leader
-
-    N2->>N1: AppendEntries heartbeat(term=8)
-    N2->>N3: AppendEntries heartbeat(term=8)
-    N3-->>N2: Ack
-
-    Note over N1,N3: Nodes receiving higher term accept Node 2 as leader
+    N1--xN2: no response
+    N3-->>N2: vote granted
+    N2->>N2: majority reached<br/>state=Leader
+    N2->>N3: Heartbeat AppendEntries(term=8)
+    N2->>N1: Heartbeat AppendEntries(term=8)
+    Note over N1,N3: Any node seeing higher term steps down to follower
 ```
 
-### Why Heartbeats Matter
-
-Heartbeats are empty or lightweight messages from the leader that say: "I am still leader for this term."
-
-If followers stop receiving heartbeats before their randomized election timeout, they start a new election.
-
-Randomized timeouts reduce the chance that every follower becomes a candidate at the same time.
+Randomized election timeouts reduce simultaneous candidacy and split votes.
 
 ---
 
-## 8. Fault-Tolerance Patterns
+## 5. Vector Clocks Evolution Example
 
-### Retries
+Two clients update a document during a network partition.
 
-Retries are useful for transient failures:
+| Step | Actor | Operation | Document Value | Vector Clock |
+|---:|---|---|---|---|
+| 0 | System | Initial value | `title="Launch"` | `{A:1}` |
+| 1 | Client 1 via Node B | Change title | `title="Launch Plan"` | `{A:1, B:1}` |
+| 2 | Client 2 via Node C | Add location | `location="Room 9"` | `{A:1, C:1}` |
+| 3 | Reader | Reads after partition heals | Sees siblings | `{A:1, B:1}` and `{A:1, C:1}` |
+| 4 | App resolver | Semantic merge | `title="Launch Plan", location="Room 9"` | `{A:1, B:1, C:1, R:1}` |
 
-- Packet loss.
-- Temporary overload.
-- Connection reset.
-- Leader failover.
-- Rate-limited dependency.
+The reader detects concurrency because neither sibling clock dominates the other.
 
-Retries are dangerous when they amplify load on an already failing service.
-
-### Exponential Backoff
-
-**Exponential backoff** increases delay after each failed attempt.
-
-Example:
-
-| Attempt | Base Delay |
-|---:|---:|
-| 1 | 100 ms |
-| 2 | 200 ms |
-| 3 | 400 ms |
-| 4 | 800 ms |
-| 5 | 1600 ms |
-
-### Why Jitter Is Required
-
-Without jitter, thousands of clients can retry in synchronized waves.
-
-If 10,000 clients all fail at the same time and retry at 1s, 2s, 4s, and 8s, the recovering backend gets crushed at exactly those moments.
-
-**Jitter** adds randomness so retries spread out over time.
-
-| Strategy | Behavior |
-|---|---|
-| **No jitter** | synchronized retry spikes |
-| **Equal jitter** | delay is partially randomized |
-| **Full jitter** | random delay between `0` and exponential cap |
-| **Decorrelated jitter** | next delay depends on previous delay plus randomness |
-
----
-
-## 9. Fallacies Of Distributed Computing
-
-The classic fallacies are wrong assumptions engineers make when systems cross the network.
-
-| Fallacy | Reality |
-|---|---|
-| **The network is reliable** | Packets drop, links fail, connections reset |
-| **Latency is zero** | Every remote call consumes time budget |
-| **Bandwidth is infinite** | Payload size and fanout matter |
-| **The network is secure** | Authenticate, authorize, encrypt, and audit |
-| **Topology does not change** | Instances, routes, regions, and leaders change |
-| **There is one administrator** | Ownership spans teams and vendors |
-| **Transport cost is zero** | Serialization, TLS, syscalls, queues, and retries cost CPU |
-| **The network is homogeneous** | Clients, regions, protocols, and hardware differ |
-
-The practical lesson: every remote call needs a deadline, retry policy, idempotency story, observability, and fallback behavior.
-
----
-
-## 10. Circuit Breakers
-
-A **circuit breaker** prevents cascading failures by failing fast when a dependency is unhealthy.
-
-### States
-
-| State | Behavior |
-|---|---|
-| **Closed** | Requests flow normally |
-| **Open** | Requests fail immediately without calling dependency |
-| **Half-open** | A limited number of trial requests test recovery |
-
-### Decorator-Style Pseudo-Code
+### Calendar Invite Semantic Reconciliation
 
 ```python
-import functools
-import time
-from enum import Enum
+def merge_calendar_invite(siblings: list[dict], resolver_node: str) -> dict:
+    merged = {
+        "title": None,
+        "location": None,
+        "attendees": set(),
+        "vector_clock": {},
+    }
 
+    for version in siblings:
+        if version.get("title"):
+            merged["title"] = version["title"]
+        if version.get("location"):
+            merged["location"] = version["location"]
+        merged["attendees"].update(version.get("attendees", []))
 
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
+        for node, counter in version["vector_clock"].items():
+            merged["vector_clock"][node] = max(
+                merged["vector_clock"].get(node, 0),
+                counter,
+            )
 
-
-class CircuitOpenError(Exception):
-    pass
-
-
-class CircuitBreaker:
-    def __init__(
-        self,
-        failure_threshold: int,
-        recovery_timeout_seconds: float,
-        half_open_max_calls: int = 1,
-    ) -> None:
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout_seconds = recovery_timeout_seconds
-        self.half_open_max_calls = half_open_max_calls
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.opened_at = 0.0
-        self.half_open_in_flight = 0
-
-    def __call__(self, func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            self._before_call()
-            try:
-                result = func(*args, **kwargs)
-            except Exception:
-                self._record_failure()
-                raise
-            else:
-                self._record_success()
-                return result
-
-        return wrapper
-
-    def _before_call(self) -> None:
-        if self.state == CircuitState.OPEN:
-            if time.monotonic() - self.opened_at >= self.recovery_timeout_seconds:
-                self.state = CircuitState.HALF_OPEN
-                self.half_open_in_flight = 0
-            else:
-                raise CircuitOpenError("dependency circuit is open")
-
-        if self.state == CircuitState.HALF_OPEN:
-            if self.half_open_in_flight >= self.half_open_max_calls:
-                raise CircuitOpenError("dependency recovery probe already in flight")
-            self.half_open_in_flight += 1
-
-    def _record_success(self) -> None:
-        if self.state == CircuitState.HALF_OPEN:
-            self.half_open_in_flight = max(0, self.half_open_in_flight - 1)
-
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-
-    def _record_failure(self) -> None:
-        if self.state == CircuitState.HALF_OPEN:
-            self.half_open_in_flight = max(0, self.half_open_in_flight - 1)
-
-        self.failure_count += 1
-        if self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            self.opened_at = time.monotonic()
-
-
-breaker = CircuitBreaker(failure_threshold=5, recovery_timeout_seconds=30)
-
-
-@breaker
-def call_payment_service(request):
-    return payment_client.capture(request)
+    merged["vector_clock"][resolver_node] = merged["vector_clock"].get(resolver_node, 0) + 1
+    merged["attendees"] = sorted(merged["attendees"])
+    return merged
 ```
 
-### Circuit Breaker Design Notes
-
-| Concern | Guidance |
-|---|---|
-| **Failure counting** | Track by dependency and route, not globally |
-| **Timeouts** | Timeouts should count as failures |
-| **Half-open probes** | Allow only a small number of trial requests |
-| **Fallbacks** | Return cached data, degraded responses, or clear errors |
-| **Metrics** | Emit state changes, rejected calls, failures, and recovery events |
-| **Bulkheads** | Use separate pools so one dependency cannot exhaust all workers |
+> ⚠️ **Failure mode**  
+> Last-write-wins might drop the location or attendee update. Semantic reconciliation preserves user intent when operations are mergeable.
 
 ---
 
-## 11. Interview And Design Review Checklist
+## 6. Idempotency In Practice
 
-Before approving a distributed communication design, ask:
+Retries are mandatory in distributed systems. Idempotency makes retries safe.
 
-| Question | Why It Matters |
-|---|---|
-| What is the deadline for every remote call? | Prevents infinite resource retention |
-| Are retries bounded and jittered? | Prevents retry storms |
-| Are writes idempotent? | Makes safe retries possible |
-| Is there a circuit breaker? | Prevents cascading failures |
-| Is the protocol appropriate? | Avoids using JSON polling for streaming or gRPC for broad public clients |
-| Is serialization cost measured? | Payload size and CPU matter at scale |
-| What happens during leader failover? | Consensus transitions affect availability |
-| How are conflicting versions detected? | AP systems need reconciliation |
-| What metrics prove health? | Latency, saturation, errors, and retries reveal failure early |
+### Pattern
+
+1. Client generates a UUID idempotency key.
+2. Server starts a transaction.
+3. Server checks whether the key already exists.
+4. If yes, return the stored response.
+5. If no, perform the operation and store the response with the key.
+6. Expire idempotency keys after a TTL.
+
+### Relational Table
+
+```sql
+CREATE TABLE idempotency_keys (
+    key VARCHAR(128) PRIMARY KEY,
+    operation VARCHAR(128) NOT NULL,
+    request_hash CHAR(64) NOT NULL,
+    response_json JSONB NOT NULL,
+    status_code INT NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX idx_idempotency_created_at
+ON idempotency_keys (created_at);
+```
+
+### When Idempotency Is Not Enough
+
+Idempotency protects duplicate retries of the same operation. It does not make conflicting operations commute.
+
+Examples:
+
+- `set balance = 50` and `withdraw 10` are not interchangeable.
+- Two calendar edits may need semantic merge.
+- Increment counters can be retried safely only with deduplication or operation IDs.
+- External side effects, such as card charges, need provider-level idempotency too.
+
+---
+
+## 7. Circuit Breakers
+
+### State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: failure_count >= threshold
+    Open --> HalfOpen: recovery_timeout elapsed
+    HalfOpen --> Closed: probe successes >= required
+    HalfOpen --> Open: probe failure
+    Closed --> Closed: success resets counter
+
+    note right of Closed
+      Requests pass through.
+      Count failures/timeouts.
+    end note
+
+    note right of Open
+      Fail fast.
+      Protect callers and dependency.
+    end note
+
+    note right of HalfOpen
+      Allow limited probes.
+      Do not unleash all traffic.
+    end note
+```
+
+### Latency Behavior During Recovery
+
+```mermaid
+xychart-beta
+    title "Circuit Breaker Latency Shape"
+    x-axis ["Healthy", "Dependency Slow", "Circuit Open", "Half-Open Probe", "Closed Again"]
+    y-axis "Caller Latency ms" 0 --> 1000
+    line "Latency" [50, 900, 5, 120, 55]
+```
+
+Open circuits return fast errors instead of tying up threads on doomed calls.
+
+---
+
+## 8. Fallacies Of Distributed Computing
+
+| Fallacy | Real-World Incident Shape | Mitigation |
+|---|---|---|
+| **The network is reliable** | DNS or routing outage makes a healthy region unreachable | Retries, multi-region routing, cached DNS, graceful degradation |
+| **Latency is zero** | Cross-region calls turn a 50 ms endpoint into 500 ms p99 | Deadlines, locality, caching, async workflows |
+| **Bandwidth is infinite** | Fanout or large JSON payloads saturate links | Compression, pagination, binary serialization, backpressure |
+| **The network is secure** | Internal service accepts spoofed traffic | mTLS, authz, network policy, audit logs |
+| **Topology does not change** | Autoscaling replaces instances and old IPs fail | Service discovery, health checks, connection draining |
+| **There is one administrator** | Cloud, DNS, SaaS, and internal teams have separate control planes | Runbooks, ownership maps, escalation paths |
+| **Transport cost is zero** | TLS handshakes and JSON parsing consume CPU under load | Connection pooling, session resumption, efficient serialization |
+| **The network is homogeneous** | Mobile, enterprise NAT, and regional networks behave differently | Adaptive timeouts, client telemetry, edge routing |
+
+---
+
+## 9. Fault-Tolerance Patterns
+
+### Exponential Backoff With Jitter
+
+Retries without jitter synchronize clients into waves. Jitter spreads them out.
+
+| Attempt | Base Delay | Full Jitter Range |
+|---:|---:|---:|
+| 1 | 100 ms | 0-100 ms |
+| 2 | 200 ms | 0-200 ms |
+| 3 | 400 ms | 0-400 ms |
+| 4 | 800 ms | 0-800 ms |
+
+Only retry operations that are safe: reads, idempotent writes, or writes with idempotency keys.
+
+---
+
+## 10. How To Test Distributed Communication
+
+Failure must be tested before production.
+
+### Toxiproxy-Style Failure Injection
+
+Tools such as Toxiproxy sit between client and dependency and inject network faults.
+
+```text
+client -> toxiproxy -> dependency
+```
+
+Test scenarios:
+
+| Scenario | What To Simulate | Expected Behavior |
+|---|---|---|
+| **Latency spike** | Add 500 ms delay | Deadlines fire; circuit breaker may open |
+| **Packet loss** | Drop 5-20% traffic | Retries with jitter; no retry storm |
+| **Connection reset** | Close connections abruptly | Client reconnects; pool recovers |
+| **Partition** | Block dependency entirely | Circuit opens; fallback path activates |
+| **Slow reads** | Throttle bandwidth | Backpressure and timeout behavior visible |
+| **DNS failure** | Return NXDOMAIN or stale IP | Cached DNS or alternate route used |
+
+### Example Commands
+
+```bash
+# Conceptual toxiproxy workflow
+toxiproxy-cli create user-db -l localhost:15432 -u db.internal:5432
+toxiproxy-cli toxic add user-db -t latency -a latency=500 -a jitter=100
+toxiproxy-cli toxic add user-db -t timeout -a timeout=2000
+```
+
+> 🧠 **Staff-engineer note**  
+> A resilience pattern is not real until you have watched it trigger in a controlled failure test.
 
 ---
 
@@ -777,36 +636,20 @@ Before approving a distributed communication design, ask:
 <details>
 <summary>How do vector clocks handle conflicting versions of a shopping cart?</summary>
 
-Vector clocks attach causal history to each object version as `(node, counter)` pairs.
-
-If version A's vector clock is less than or equal to version B's vector clock for every node, then A causally happened before B and can be superseded by B.
-
-If neither vector clock dominates the other, the versions are concurrent siblings. For a shopping cart, that can happen when two replicas accept different updates during a network partition.
-
-The database should return both versions to the application. The application then performs semantic reconciliation, usually by merging cart items rather than discarding one version. After merging, the application writes back a new version whose vector clock supersedes both siblings.
+Vector clocks attach causal history to each object version. If neither clock dominates, the versions are concurrent siblings. The database should return both to the application, and the application should merge semantically, such as unioning cart items.
 
 </details>
 
 <details>
-<summary>What are the trade-offs of using last-write-wins reconciliation?</summary>
+<summary>What are the trade-offs of last-write-wins?</summary>
 
-Last-write-wins is simple and cheap. It stores one version, avoids surfacing conflicts to the application, and keeps reads easy.
-
-The cost is silent data loss. If two clients update the same shopping cart during a partition, whichever write has the later timestamp wins, even if both updates were meaningful. Clock skew can also choose the wrong winner.
-
-Last-write-wins is acceptable for data where overwriting is harmless, such as ephemeral presence or some caches. It is dangerous for carts, balances, collaborative edits, permissions, and user-generated data where intent must be preserved.
+Last-write-wins is simple and cheap, but it can silently lose user intent and is vulnerable to clock skew. It is acceptable for ephemeral data, but dangerous for carts, balances, permissions, and collaborative edits.
 
 </details>
 
 <details>
 <summary>How does Dynamo use Merkle trees for replica synchronization?</summary>
 
-Dynamo uses Merkle trees to compare replicas efficiently without transferring every key.
-
-A Merkle tree hashes data at the leaves and then hashes those hashes up the tree. Two replicas can compare root hashes. If the root hashes match, their data ranges match. If the roots differ, the replicas recursively compare child hashes until they identify the specific ranges that diverged.
-
-This makes anti-entropy repair efficient because nodes exchange only hashes for most of the comparison and transfer actual object data only for ranges that differ.
-
-Merkle trees are especially useful in large key-value stores because full replica comparison would be too expensive in network bandwidth, disk reads, and CPU.
+Merkle trees compare replicas by hashing ranges. Matching root hashes mean ranges match. Differing hashes are recursively compared until only divergent ranges are transferred. This makes anti-entropy repair efficient.
 
 </details>
