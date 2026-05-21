@@ -80,6 +80,9 @@ Each blueprint is structured for senior system design loops: **bound the problem
 > 📐 **Math check**  
 > If read traffic is 1 billion/month instead of 100 million/month, average reads become ~386 QPS and 20x peak becomes ~7,720 QPS. The architecture still works, but cache hit ratio becomes the central SLO.
 
+> 🧠 **Staff-engineer note**  
+> The subtle trade-off is not code generation; it is choosing where correctness lives. Creation needs strong uniqueness and abuse controls, while redirects need extreme availability and can often tolerate stale-but-safe cached mappings for a short window.
+
 #### 2. High-Level Architecture (A clear textual map of component placement)
 
 **Component map**
@@ -142,17 +145,23 @@ sequenceDiagram
     E->>R: Route redirect request
     R->>M: get(code)
     alt Cache hit
+        rect rgb(232, 253, 245)
         M-->>R: destination_url
         R-->>C: 302 Location: destination_url
+        end
     else Cache miss
+        rect rgb(232, 244, 255)
         R->>D: SELECT destination_url WHERE code=?
         D-->>R: destination_url
         R->>M: set(code, destination_url, ttl+jitter)
         R-->>C: 302 Location: destination_url
+        end
     else Primary cache node failed
+        rect rgb(254, 242, 242)
         R->>G: get/set temporary hot key
         G-->>R: cached or temporary value
         R-->>C: 302 or controlled fallback
+        end
     end
     R->>Q: emit ClickRecorded event
 ```
@@ -245,15 +254,39 @@ Recommended design: allocate IDs from a dedicated ID service, encode with Base62
 | 4 | Add negative caching for nonexistent codes |
 | 5 | Replicate viral keys across multiple cache nodes |
 
+**What if...? Alias enumeration + negative cache gap**
+
+> ⚠️ **Failure mode**  
+> An attacker scans random short codes. Nonexistent codes miss cache and repeatedly hit the metadata store because only valid redirects are cached.
+
+**Walkthrough**
+
+1. Botnet generates millions of random `GET /{code}` requests.
+2. Most codes do not exist.
+3. Redirect API checks cache and misses.
+4. Metadata DB receives a high-volume stream of negative lookups.
+5. Legitimate redirects compete for DB connections.
+6. The attack becomes cheaper than defending each lookup.
+
+**Mitigation**
+
+| Step | Action |
+|---|---|
+| 1 | Cache `404 code_not_found` responses with a short TTL and jitter |
+| 2 | Rate-limit by IP, ASN, user agent, and suspicious code patterns |
+| 3 | Use Bloom filters for quick "definitely not present" checks |
+| 4 | Keep custom alias namespaces harder to enumerate |
+| 5 | Separate abuse traffic from redirect-critical capacity |
+
 **Decision log**
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Metadata store | SQL or strongly consistent KV | Code uniqueness and idempotent creation need strong constraints |
-| Redirect cache | Redis/Memcached | Redirect path is read-heavy and latency-sensitive |
-| Analytics | Async queue | Click tracking must not slow redirect |
-| Blob content | Object storage | Keeps large data out of metadata DB |
-| Hot-key mitigation | Leases + gutter pool | Prevents cache failure from becoming DB failure |
+| Decision | Choice | Rationale | Rejected alternative |
+|---|---|---|---|
+| Metadata store | SQL or strongly consistent KV | Code uniqueness and idempotent creation need strong constraints | Eventually consistent writes that can create duplicate aliases |
+| Redirect cache | Redis/Memcached | Redirect path is read-heavy and latency-sensitive | Direct DB lookup on every redirect |
+| Analytics | Async queue | Click tracking must not slow redirect | Synchronous analytics writes on redirect path |
+| Blob content | Object storage | Keeps large data out of metadata DB | Storing paste bodies inline with metadata |
+| Hot-key mitigation | Leases + gutter pool | Prevents cache failure from becoming DB failure | Rehashing failed cache keys across the normal pool |
 
 ---
 
@@ -318,6 +351,9 @@ Recommended design: allocate IDs from a dedicated ID service, encode with Base62
 
 > 📐 **Math check**  
 > If the average page is compressed to 100 KB before long-term storage, 3-year raw storage drops from 72 PB to ~14.4 PB before replication. Compression and tiering are not optimizations here; they are architectural requirements.
+
+> 🧠 **Staff-engineer note**  
+> The hardest trade-off is freshness versus politeness. A crawler that maximizes throughput without host budgets becomes an attack on the web; a crawler that is too conservative produces a stale index.
 
 #### 2. High-Level Architecture (A clear textual map of component placement)
 
@@ -387,17 +423,28 @@ sequenceDiagram
     F-->>S: URL + host budget
     S->>R: check robots rules
     alt Disallowed
+        rect rgb(254, 242, 242)
         S->>F: mark skipped / lower priority
+        end
     else Allowed
         S->>D: resolve host
         D-->>S: IP address
         S->>W: assign crawl job
         W->>Site: GET page with timeout
-        Site-->>W: HTML response
-        W->>B: store raw page
-        W->>P: parse links + content signature
-        P->>I: publish document event
-        P->>F: enqueue discovered links
+        alt Fetch succeeds
+            rect rgb(232, 253, 245)
+            Site-->>W: HTML response
+            W->>B: store raw page
+            W->>P: parse links + content signature
+            P->>I: publish document event
+            P->>F: enqueue discovered links
+            end
+        else Timeout or 429
+            rect rgb(254, 242, 242)
+            W-->>S: report fetch failure
+            S->>F: backoff host<br/>increase next_fetch_at
+            end
+        end
     end
 ```
 
@@ -501,15 +548,39 @@ Compact production systems often delta-encode sorted `doc_id`s and positions, th
 | 4 | Track HTTP 429/403 spikes and automatically cool down host |
 | 5 | Audit scheduler leases and robots decisions |
 
+**What if...? Duplicate URL explosion + index pressure**
+
+> ⚠️ **Failure mode**  
+> The crawler discovers endless URL variants such as tracking parameters, calendar pages, sort orders, and session IDs. The frontier grows faster than dedup can collapse it, and index writes are wasted on near-duplicates.
+
+**Walkthrough**
+
+1. Parser extracts millions of parameterized links from a few large sites.
+2. Canonicalization rules fail to normalize the variants.
+3. Frontier stores many URLs that render equivalent content.
+4. Fetchers waste bandwidth recrawling duplicate pages.
+5. Index shards receive redundant documents and posting lists grow.
+6. Search quality drops because duplicate pages crowd results.
+
+**Mitigation**
+
+| Step | Action |
+|---|---|
+| 1 | Canonicalize URLs before frontier insertion |
+| 2 | Strip known tracking parameters and normalize trailing slashes/case where safe |
+| 3 | Use content hashes and near-duplicate fingerprints after fetch |
+| 4 | Apply per-host frontier growth limits |
+| 5 | Feed duplicate signals back into crawl priority scoring |
+
 **Decision log**
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Raw page storage | GFS-like blob/chunk store | Petabyte-scale data plane requires distributed storage |
-| Frontier | Priority queue / sorted-set model | Crawl order depends on freshness and importance |
-| Reverse index | Specialized index shards | Term lookups need posting-list efficiency |
-| Dedup | Hashes + near-duplicate signatures | Prevents graph loops and duplicate storage |
-| Politeness | Host-level scheduler budget | External systems must be protected |
+| Decision | Choice | Rationale | Rejected alternative |
+|---|---|---|---|
+| Raw page storage | GFS-like blob/chunk store | Petabyte-scale data plane requires distributed storage | Storing raw pages in one relational database |
+| Frontier | Priority queue / sorted-set model | Crawl order depends on freshness and importance | FIFO crawl queue with no recrawl priority |
+| Reverse index | Specialized index shards | Term lookups need posting-list efficiency | Scanning document blobs at query time |
+| Dedup | Hashes + near-duplicate signatures | Prevents graph loops and duplicate storage | URL-only dedupe, which misses mirrored content |
+| Politeness | Host-level scheduler budget | External systems must be protected | Worker-local throttles with no global host view |
 
 ---
 
@@ -568,6 +639,9 @@ Compact production systems often delta-encode sorted `doc_id`s and positions, th
 
 > 📐 **Math check**  
 > If average fanout rises from 10 to 200, fanout deliveries jump from 60,000/sec to ~1.2 million/sec. The hybrid celebrity strategy becomes mandatory, not optional.
+
+> 🧠 **Staff-engineer note**  
+> The subtle trade-off is read latency versus write amplification. Pushing tweets makes home reads cheap, but the moment a celebrity posts, the write path can become the largest workload in the system.
 
 #### 2. High-Level Architecture (A clear textual map of component placement)
 
@@ -637,10 +711,19 @@ sequenceDiagram
     K->>F: consume event
     F->>G: get followers(author_id)
     alt Normal author
+        rect rgb(232, 253, 245)
         F->>R: LPUSH tweet_ref into follower timelines
         F->>R: LTRIM timeline buckets
+        end
     else Celebrity author
+        rect rgb(232, 244, 255)
         F->>S: index tweet for read-time pull
+        end
+    else Fanout backlog or Redis timeout
+        rect rgb(254, 242, 242)
+        F-->>K: leave event uncommitted / retry later
+        F->>S: mark author for read-time fallback
+        end
     end
     C->>H: GET /v1/timeline/home
     H->>R: read pushed timeline refs
@@ -785,15 +868,39 @@ flowchart TB
 > 🧠 **Staff-engineer note**  
 > The hybrid timeline model creates two correctness paths: pushed normal tweets and pulled celebrity tweets. The merge layer must be observable as its own dependency, not hidden inside the read API.
 
+**What if...? Fan-out backlog after a regional event**
+
+> ⚠️ **Failure mode**  
+> A sports final ends and millions of normal users tweet at once. Kafka absorbs the write spike, but fanout workers lag. Home timelines look stale even though tweet creation is healthy.
+
+**Walkthrough**
+
+1. Tweet Write API persists tweets and publishes events successfully.
+2. Kafka topic lag grows faster than fanout workers can drain it.
+3. Redis timeline buckets are updated minutes late.
+4. Users refresh home timelines and do not see fresh posts.
+5. Read traffic rises because users keep refreshing.
+6. Fanout and read systems now amplify each other.
+
+**Mitigation**
+
+| Step | Action |
+|---|---|
+| 1 | Partition fanout by author ID and overprovision worker pools for known events |
+| 2 | Show a "new posts available" marker based on durable tweet writes |
+| 3 | Temporarily pull recent tweets for followed users whose fanout is lagging |
+| 4 | Apply per-author write backpressure for abusive burst sources |
+| 5 | Track fanout lag separately from tweet write success |
+
 **Decision log**
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Timeline refs | Redis lists | O(1) recent timeline reads |
-| Fanout model | Hybrid push/pull | Normal users optimize reads; celebrities avoid write explosion |
-| Event transport | Kafka | Fanout needs partitioning, replay, and backpressure |
-| Media | Object storage + CDN | Large media should not pass through tweet DB |
-| Cache failure | Gutter pool + leases | Prevents cache outage from crushing stores |
+| Decision | Choice | Rationale | Rejected alternative |
+|---|---|---|---|
+| Timeline refs | Redis lists | O(1) recent timeline reads | Recomputing full home timeline from graph on every request |
+| Fanout model | Hybrid push/pull | Normal users optimize reads; celebrities avoid write explosion | Pure fanout-on-write for all accounts |
+| Event transport | Kafka | Fanout needs partitioning, replay, and backpressure | Direct synchronous writes to every follower timeline |
+| Media | Object storage + CDN | Large media should not pass through tweet DB | Storing media blobs in tweet rows |
+| Cache failure | Gutter pool + leases | Prevents cache outage from crushing stores | Letting all timeline cache misses hit primary stores |
 
 ---
 
@@ -845,10 +952,30 @@ flowchart TB
 | 24h raw comments | 360 MB x 24 | ~8.6 GB/day for one huge room |
 | Direct fanout bandwidth | 333/sec x 1M x 300 B | ~100 GB/sec |
 
+**1M viewer event bounding table**
+
+| Dimension | Assumption | Calculation | Design Implication |
+|---|---:|---:|---|
+| WebSocket gateways | 50,000 stable sockets/gateway | 1,000,000 / 50,000 | ~20 gateways minimum; deploy 30-40 for headroom |
+| Comment writes | 1% commenters, 1 per 30 sec | 10,000 / 30 | ~333 writes/sec before moderation |
+| Moderation QPS | Every comment scored | ~333/sec | Inline lightweight checks; heavy ML async or sampled |
+| Durable writes | Store all accepted comments | ~333/sec | Easy for append log; fanout is the hard part |
+| Recent buffer memory | 5 min x 333/sec x 300 B | ~30 MB raw per hot room | Keep replicated in memory by room shard |
+| Batched delivery | 4 batches/sec per room | 1M x 4 frames/sec | Gateways send fewer, larger frames |
+| Direct message fanout | 333 x 1M x 300 B | ~100 GB/sec | Not acceptable without filtering/batching |
+| Sampled fanout | 20 comments/sec x 1M x 300 B | ~6 GB/sec | Still large, but feasible with regional fanout and compression |
+| Regional split | 5 regions | 1M / 5 | ~200k sockets/region and local room fanout |
+| Replay bandwidth spike | 100k reconnects x 100 comments x 300 B | ~3 GB burst | Throttle replay and compress batches |
+
 > 📐 **Math check**  
 > Directly sending every comment to every viewer does not scale. Large rooms need sampling, batching, ranking, regional fanout trees, or client-side throttling.
 
+> 🧠 **Staff-engineer note**  
+> The subtle trade-off is fidelity versus survivability. Small rooms can receive every message; massive rooms need controlled loss, ranking, batching, or slow-mode so the live experience remains coherent.
+
 #### 2. High-Level Architecture (A clear textual map of component placement)
+
+**Component placement diagram**
 
 ```mermaid
 flowchart LR
@@ -889,6 +1016,36 @@ flowchart LR
     style Data fill:#ecfdf5,stroke:#059669
 ```
 
+```mermaid
+flowchart TB
+    Room["Hot Room<br/>event_id=finals-2026"]
+    Broker["Room Partition<br/>ordered comment log"]
+
+    subgraph RegionA["Region A"]
+        FanoutA["Regional Fanout Workers"]
+        BufferA["Recent Buffer<br/>5 min window"]
+        GatewayA1["WS Gateway A1<br/>50k sockets"]
+        GatewayA2["WS Gateway A2<br/>50k sockets"]
+    end
+
+    subgraph RegionB["Region B"]
+        FanoutB["Regional Fanout Workers"]
+        BufferB["Recent Buffer<br/>5 min window"]
+        GatewayB1["WS Gateway B1<br/>50k sockets"]
+        GatewayB2["WS Gateway B2<br/>50k sockets"]
+    end
+
+    Room --> Broker
+    Broker --> FanoutA
+    Broker --> FanoutB
+    FanoutA --> BufferA
+    FanoutB --> BufferB
+    FanoutA --> GatewayA1
+    FanoutA --> GatewayA2
+    FanoutB --> GatewayB1
+    FanoutB --> GatewayB2
+```
+
 **Critical path: comment delivery**
 
 ```mermaid
@@ -907,17 +1064,32 @@ sequenceDiagram
     R-->>E: recent comments
     E-->>C: replay recent comments
     C->>I: post comment(idempotency_key, room_id, body)
+    I->>S: insert idempotency key
+    alt Duplicate retry
+        rect rgb(232, 244, 255)
+        S-->>I: existing comment_id
+        I-->>C: return existing accepted comment
+        end
+    else First submission
+        rect rgb(232, 253, 245)
+        S-->>I: reserve comment_id
+        end
+    end
     I->>M: validate / score
     alt Allowed
+        rect rgb(232, 253, 245)
         M->>B: publish CommentCreated(room_id key)
         B->>S: append durable log
         B->>R: append recent buffer
         B->>F: deliver to room shard
         F->>E: batched fanout
         E-->>C: comment event
+        end
     else Blocked
+        rect rgb(254, 242, 242)
         M-->>I: reject
         I-->>C: moderation rejection
+        end
     end
 ```
 
@@ -1004,27 +1176,102 @@ ON live_comments (room_id, created_at DESC);
 | 5 | Drop non-critical comments before dropping connections |
 | 6 | Keep recent replay buffer so clients can resync |
 
+**Additional mitigations for million-viewer rooms**
+
+| Mitigation | Effect |
+|---|---|
+| Batch comments into frames | Reduces syscall and packet overhead |
+| Sample or rank comments | Preserves a readable stream when every comment cannot be shown |
+| Regional fanout trees | Keeps delivery local and avoids central broadcaster saturation |
+| Per-room slow mode | Reduces write rate at the source |
+| Gateway backpressure | Drops comment updates before dropping the WebSocket |
+| Recent buffer replay | Lets clients reconnect without expensive DB reads |
+
+**What if...? Moderation service slows down**
+
+> ⚠️ **Failure mode**  
+> Moderation latency rises from milliseconds to seconds. Comment ingestion queues grow, users retry submissions, and idempotency becomes the difference between one delayed comment and many duplicates.
+
+**Walkthrough**
+
+1. A moderation model deploy increases p99 latency.
+2. Comment Ingest API holds requests longer.
+3. Clients timeout and retry with the same idempotency key.
+4. Without dedupe, the same comment is accepted multiple times.
+5. Fanout sends duplicates and room quality degrades.
+6. Moderation backlog hides abusive content longer.
+
+**Mitigation**
+
+| Step | Action |
+|---|---|
+| 1 | Store idempotency key before moderation work |
+| 2 | Use fast rules inline and push expensive scoring to async review |
+| 3 | Apply temporary slow-mode or subscriber-only mode |
+| 4 | Fail closed for high-risk rooms and fail open only for trusted channels |
+| 5 | Expose moderation p99 and backlog as launch-blocking metrics |
+
 **Decision log**
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Client protocol | WebSockets | Bidirectional low-latency updates |
-| Broker | Partitioned pub/sub | Room-based ordering and fanout |
-| Storage | Append-oriented comment log | Replay, audit, moderation |
-| Dedup | Idempotency key + client sequence | Required under retries |
-| Hot-room strategy | Batching + ranking + regional fanout | Direct broadcast is too expensive |
+| Decision | Choice | Rationale | Rejected alternative |
+|---|---|---|---|
+| Client protocol | WebSockets | Bidirectional low-latency updates | Short polling for every viewer |
+| Broker | Partitioned pub/sub | Room-based ordering and fanout | One global broadcast topic for all rooms |
+| Storage | Append-oriented comment log | Replay, audit, moderation | Only ephemeral gateway memory |
+| Dedup | Idempotency key + client sequence | Required under retries | Trusting client retries to be rare |
+| Hot-room strategy | Batching + ranking + regional fanout | Direct broadcast is too expensive | Sending every comment individually to every socket |
 
 ---
 
 ## 10-Point System Design Evaluation Checklist
 
-- [ ] **Explicit bounding:** Calculates storage, read/write QPS, peak multipliers, and bandwidth before choosing architecture.
-- [ ] **Clear requirements:** Separates functional requirements, non-functional requirements, and consistency boundaries.
-- [ ] **Layered request path:** Places DNS, CDN, L4/L7 load balancers, stateless APIs, caches, queues, and databases coherently.
-- [ ] **Storage fit:** Chooses SQL, NoSQL, object storage, graph storage, or search indexes based on access patterns.
-- [ ] **Cache depth:** Addresses hot keys, stampedes, TTL jitter, negative caching, leases, and emergency cache capacity.
-- [ ] **Async decoupling:** Uses queues or logs to isolate slow work, fanout, analytics, indexing, and retries.
-- [ ] **Backpressure:** Defines what happens when workers, brokers, databases, or downstream APIs cannot keep up.
-- [ ] **Distributed correctness:** Applies CAP, replication lag handling, vector clocks, idempotency, or leader/lease concepts where relevant.
-- [ ] **Global design:** Explains multi-region routing, replication, CDN/object storage placement, and read-after-write behavior.
-- [ ] **Graceful degradation:** States exactly what users see during partial failures and how core flows remain available.
+- [ ] **Explicit bounding:** Calculates storage, read/write QPS, peak multipliers, and bandwidth before choosing architecture. Example: Live Comments shows why 333 comments/sec becomes ~100 GB/sec if every comment is sent to 1M viewers.
+- [ ] **Clear requirements:** Separates functional requirements, non-functional requirements, and consistency boundaries. Example: URL Shortener requires strong uniqueness on create, but analytics can be eventually consistent.
+- [ ] **Layered request path:** Places DNS, CDN, L4/L7 load balancers, stateless APIs, caches, queues, and databases coherently. Example: URL redirects go through edge, Redirect API, cache, metadata store, and async analytics queue.
+- [ ] **Storage fit:** Chooses SQL, NoSQL, object storage, graph storage, or search indexes based on access patterns. Example: Twitter uses a tweet store, follow graph, Redis timeline refs, search index, and object storage for media.
+- [ ] **Cache depth:** Addresses hot keys, stampedes, TTL jitter, negative caching, leases, and emergency cache capacity. Example: URL Shortener handles viral redirect keys with leases, gutter cache, and negative caching for nonexistent codes.
+- [ ] **Async decoupling:** Uses queues or logs to isolate slow work, fanout, analytics, indexing, and retries. Example: Twitter writes tweets durably first, then Kafka fanout updates home timelines asynchronously.
+- [ ] **Backpressure:** Defines what happens when workers, brokers, databases, or downstream APIs cannot keep up. Example: Web Crawler cools down hosts on 429/403 spikes and enforces host token buckets.
+- [ ] **Distributed correctness:** Applies CAP, replication lag handling, vector clocks, idempotency, or leader/lease concepts where relevant. Example: Live Comments stores idempotency keys before moderation so client retries do not create duplicate comments.
+- [ ] **Global design:** Explains multi-region routing, replication, CDN/object storage placement, and read-after-write behavior. Example: Live Comments splits a hot room through regional fanout workers and WebSocket gateways.
+- [ ] **Graceful degradation:** States exactly what users see during partial failures and how core flows remain available. Example: Twitter returns a partial timeline if celebrity pull queries fail, while marking the response degraded for observability.
+
+---
+
+## Common Interview Mistakes For Each Blueprint
+
+### URL Shortener
+
+- Underestimating hot-key impact when one short link goes viral.
+- Forgetting negative caching for nonexistent codes during enumeration attacks.
+- Doing click analytics synchronously on the redirect path.
+- Treating random code generation as collision-free without a unique constraint.
+- Ignoring abuse, expiration, and disabled-link propagation.
+- Storing large paste content in the same hot metadata table.
+
+### Web Crawler
+
+- Forgetting robots.txt, per-host politeness, and external harm.
+- Using a simple FIFO queue instead of a frontier with priority and `next_fetch_at`.
+- Deduplicating only by URL and missing mirrored or near-duplicate content.
+- Ignoring canonicalization, tracking parameters, and infinite URL spaces.
+- Treating raw page storage as small enough for a normal database.
+- Designing search serving and crawl ingestion as one coupled system.
+
+### Twitter Timeline
+
+- Choosing pure fanout-on-write and only discovering celebrity explosion later.
+- Choosing pure fanout-on-read and making every home timeline read expensive.
+- Storing full tweet bodies in every user's home timeline cache.
+- Forgetting fanout lag, replay, and backpressure after Kafka.
+- Treating counters, likes, and timelines as strongly consistent when eventual consistency is acceptable.
+- Ignoring cache failure and thundering herds on timeline reads.
+
+### Live Comments System
+
+- Multiplying write QPS but forgetting fanout delivery bandwidth.
+- Sending every comment to every viewer in a million-viewer room.
+- Forgetting idempotency when mobile clients retry comment submissions.
+- Keeping recent history only on one WebSocket gateway, making reconnects expensive or lossy.
+- Treating moderation as either fully synchronous or fully absent instead of tiered.
+- Ignoring slow clients and unbounded gateway send buffers.
