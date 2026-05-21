@@ -1,12 +1,41 @@
 # System Design Academy
 
+Learn how real distributed systems break, and how to design them so they recover.
+
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Language: Python](https://img.shields.io/badge/language-Python-3776AB)](#)
+![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)
+![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 
 > **An interactive engineering manual for senior-level system design preparation, built around real architecture trade-offs, production code templates, and FAANG-style whiteboard execution.**
 
-System Design Academy is a professional, open-source curriculum for engineers who want to move beyond memorized diagrams and learn how large systems actually behave under load, failure, replication lag, cache pressure, and global traffic.
+System Design Academy is a professional, open-source curriculum for engineers who want to move beyond memorized diagrams and learn how large systems actually behave under load, failure, replication lag, cache pressure, global traffic, and async backlogs.
+
+| Quick Overview | Details |
+|---|---|
+| **Modules** | 5 deep-dive modules |
+| **Blueprints** | 3 core blueprints, soon 4 with Live Comments |
+| **Languages used** | Python, TypeScript |
+| **Paper references** | Dynamo, GFS, Facebook Memcached |
+| **Primary audience** | Backend engineers preparing for senior system design interviews |
+
+---
+
+## Table Of Contents
+
+- [Curriculum Overview](#curriculum-overview)
+- [What Makes This Different](#what-makes-this-different)
+- [Prerequisites](#prerequisites)
+- [Getting Started](#getting-started)
+- [Running The Code Locally](#running-the-code-locally)
+- [How To Use This Repo For Interview Prep](#how-to-use-this-repo-for-interview-prep)
+- [Who This Is For](#who-this-is-for)
+- [How To Contribute](#how-to-contribute)
+- [Community & Support](#community--support)
+- [Roadmap](#roadmap)
+- [License](#license)
 
 ---
 
@@ -19,18 +48,62 @@ System Design Academy is a professional, open-source curriculum for engineers wh
 | 03 | [Caching Strategies & Memory Management](modules/03-caching-memory.md) | Cache-aside, write-through, write-behind, LRU internals, Facebook Memcached patterns, leases, and cache crisis handling |
 | 04 | [Distributed Systems & Communication](modules/04-distributed-comm.md) | TCP/UDP, REST vs gRPC vs WebSockets, consensus, Raft leader election, circuit breakers, retries, and jitter |
 | 05 | [Asynchronous Processing & Message Queues](modules/05-async-messaging.md) | Message queues, pub/sub, Kafka partitions, RabbitMQ task queues, acknowledgments, backpressure, retries, and DLQs |
-| 06 | [Real-World System Design Blueprints](blueprints/system-designs.md) | Interview-ready designs for a URL shortener, web crawler, and Twitter/X timeline engine |
+| 06 | [Real-World System Design Blueprints](blueprints/system-designs.md) | Interview-ready designs for a URL shortener, web crawler, Twitter/X timeline engine, and an evolving Live Comments system |
+
+### Recommended Learning Path
+
+```mermaid
+flowchart LR
+    M1["01 Traffic Routing<br/>DNS, CDN, L4/L7"]
+    M2["02 Database Scaling<br/>CAP, sharding, Dynamo, GFS"]
+    M3["03 Caching<br/>Memcached, LRU, stampedes"]
+    M4["04 Distributed Communication<br/>gRPC, Raft, idempotency"]
+    M5["05 Async Messaging<br/>queues, DLQs, backpressure"]
+    BP["Blueprints<br/>URL shortener, crawler, timeline,<br/>live comments"]
+
+    M1 --> M2
+    M2 --> M3
+    M2 --> M4
+    M3 --> M5
+    M4 --> M5
+    M5 --> BP
+    M1 --> BP
+    M2 --> BP
+```
 
 ---
 
-## Why This Repo?
+## What Makes This Different
 
 Most system design resources stop at boxes and arrows. This repository is built to go deeper.
 
-- **Mermaid-rendered architecture diagrams** for concrete request paths, cache flows, consensus, fanout, and queue processing.
-- **Production-ready code snippets** in Python and TypeScript for reverse proxies, consistent hashing, LRU caches, gRPC services, RabbitMQ workers, and retry patterns.
-- **FAANG-style interview preparation** with explicit requirements, back-of-the-envelope math, bottleneck analysis, and senior-level trade-off framing.
-- **Paper-inspired engineering lessons** from systems like Dynamo, GFS, and Facebook Memcached, translated into practical design patterns.
+| Differentiator | What It Means |
+|---|---|
+| **Whiteboard-ready trade-offs** | Every concept is framed with decision matrices, staff-engineer notes, and interview-ready trade-off language. |
+| **Production code templates** | Runnable Python and TypeScript examples cover reverse proxies, consistent hashing, LRU caches, gRPC services, RabbitMQ workers, circuit breakers, and retries. |
+| **Failure-driven explanations** | Modules explain how systems fail: split-brain, cache stampedes, poison messages, retry storms, replication lag, and hot partitions. |
+| **Paper-to-practice** | Lessons from Dynamo, GFS, and Facebook Memcached are translated into actionable architecture patterns. |
+
+You will still get Mermaid-rendered architecture diagrams, FAANG-style interview preparation, back-of-the-envelope math, and concrete bottleneck analysis. The point is not to memorize diagrams. The point is to build engineering judgment.
+
+---
+
+## Prerequisites
+
+| Assumed Knowledge | Why It Helps |
+|---|---|
+| Basic networking: TCP, HTTP, DNS | Needed for routing, load balancing, and failure-mode discussions |
+| SQL and NoSQL fundamentals | Needed for replication, sharding, indexing, and consistency trade-offs |
+| Ability to read Python or TypeScript pseudocode | Code templates use both languages |
+| Interest in distributed systems | Consensus, replication, messaging, and retries show up throughout |
+
+Optional but helpful:
+
+| Background | Useful For |
+|---|---|
+| Cloud experience | Understanding managed load balancers, databases, queues, and regional failover |
+| Containerization | Running RabbitMQ, Toxiproxy, and service examples locally |
+| Metrics and monitoring | Making sense of p99 latency, queue lag, DLQ size, cache hit rate, and error budgets |
 
 ---
 
@@ -64,17 +137,92 @@ Recommended study loop:
 
 ---
 
+## Running The Code Locally
+
+The academy is primarily Markdown-based, but the modules include standalone Python and TypeScript templates you can run or adapt.
+
+```bash
+# Clone the repo
+git clone https://github.com/MachariaP/system-design-academy.git
+cd system-design-academy
+
+# Set up Python virtual environment for code examples
+python -m venv venv
+source venv/bin/activate  # or .\venv\Scripts\activate on Windows
+pip install -r requirements.txt
+```
+
+Example workflow for Python snippets:
+
+```bash
+# Create a local scratch file for a module snippet, then run it
+mkdir -p scratch
+# Example: paste the consistent hashing demo from modules/02-database-scaling.md
+python scratch/consistent_hashing_demo.py
+```
+
+Example workflow for TypeScript snippets:
+
+```bash
+# Reverse proxy examples use Node.js packages
+npm init -y
+npm install prom-client tsx
+npx tsx scratch/proxy.ts
+```
+
+Each module’s code blocks are designed to be standalone and can be copied directly into a scratch file. Some examples need external services such as RabbitMQ, PostgreSQL, or Toxiproxy; the relevant module notes call those dependencies out.
+
+---
+
+## How To Use This Repo For Interview Prep
+
+> **📘 Study plan**
+>
+> **Week 1:** Study Modules 01-03: Traffic Routing, Database Scaling, and Caching. Re-draw every Mermaid diagram from memory and explain the bottleneck each diagram is protecting.
+>
+> **Week 2:** Study Modules 04-05: Distributed Communication and Async Messaging. Then work through the blueprints and do at least one mock interview with a peer.
+>
+> **Daily:** Pick one failure scenario or “What if...?” section and explain the mitigation out loud in 3-5 minutes. Focus on what breaks first, what metric proves it, and what trade-off your fix introduces.
+
+---
+
+## Who This Is For
+
+- Backend engineers preparing for senior system design interviews.
+- Distributed systems learners who want practical architecture mechanics.
+- Developer advocates and educators building teaching material.
+- Engineering teams looking for clean internal study references.
+- Open-source contributors who enjoy turning complex systems into clear guides.
+
+---
+
 ## How To Contribute
 
 Contributions are welcome, especially from engineers who want to add practical, interview-grade system design blueprints.
 
-Good contributions include:
+| Contribution Type | What To Include |
+|---|---|
+| **New system design blueprint** | Requirements table, architecture diagram, component deep-dive, failure scenarios, decision log |
+| **Code template** | Language, dependencies, usage example, error handling, observability |
+| **Diagram improvement** | Mermaid source, caption, clear separation of control plane and data plane |
+| **Typo or clarification** | Brief description and why it improves accuracy |
+
+Good contributions also include:
 
 - New system design case studies.
 - Improved architecture diagrams.
 - More production-grade code templates.
 - Better capacity estimates and bottleneck analysis.
 - Corrections, clarifications, and source-backed improvements.
+
+### Style Guide
+
+- Use Mermaid for diagrams.
+- Use `🧠` for staff-engineer notes.
+- Use `⚠️` for failure modes.
+- Keep code blocks runnable where possible.
+- Prefer concrete numbers, assumptions, and trade-offs over generic claims.
+- Separate control plane and data plane when drawing architecture diagrams.
 
 Suggested workflow:
 
@@ -95,13 +243,38 @@ Then open a pull request with:
 
 ---
 
-## Who This Is For
+## Community & Support
 
-- Backend engineers preparing for senior system design interviews.
-- Distributed systems learners who want practical architecture mechanics.
-- Developer advocates and educators building teaching material.
-- Engineering teams looking for clean internal study references.
-- Open-source contributors who enjoy turning complex systems into clear guides.
+Have a question, correction, or blueprint request?
+
+- Open a [GitHub issue](https://github.com/MachariaP/system-design-academy/issues) for bugs, clarifications, or content requests.
+- Use GitHub Discussions if enabled for longer design conversations and study-group threads.
+- Share the repository with another engineer preparing for system design interviews.
+
+Optional share snippet:
+
+```markdown
+I am studying system design with System Design Academy:
+https://github.com/MachariaP/system-design-academy
+
+It covers traffic routing, database scaling, caching, distributed communication,
+async messaging, and real-world system design blueprints.
+```
+
+Star history:
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MachariaP/system-design-academy&type=Date)](https://star-history.com/#MachariaP/system-design-academy&Date)
+
+---
+
+## Roadmap
+
+What’s next:
+
+- Live Comments System blueprint with real-time WebSocket fanout.
+- Kubernetes deployment examples for each blueprint.
+- Video walkthroughs of each module.
+- Interactive quizzes for self-assessment.
 
 ---
 
