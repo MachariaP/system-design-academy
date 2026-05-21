@@ -34,12 +34,16 @@ sequenceDiagram
 
     App->>Cache: GET key
     alt Cache hit
+        Note over App,Cache: ~1-3 ms: network + cache lookup
         Cache-->>App: value
     else Cache miss
+        Note over App,DB: miss path pays cache lookup + DB read + cache fill
         Cache-->>App: miss
         App->>DB: SELECT key
+        Note over App,DB: ~10-100+ ms depending DB/query/load
         DB-->>App: value
         App->>Cache: SET key value TTL
+        Note over App,Cache: async or best-effort fill is common
         App-->>App: return value
     end
 ```
@@ -55,9 +59,11 @@ sequenceDiagram
     participant DB as Database
 
     App->>Cache: PUT key value
+    Note over App,DB: write latency includes synchronous DB commit
     Cache->>DB: synchronous write
     DB-->>Cache: commit ok
     Cache->>Cache: update cached value
+    Note over Cache: future reads are hot immediately
     Cache-->>App: success
 ```
 
@@ -75,10 +81,12 @@ sequenceDiagram
 
     App->>Cache: PUT key value
     Cache->>Queue: append mutation
+    Note over Cache,Queue: fast path waits only for durable queue/WAL ack
     Queue-->>Cache: durable ack
     Cache->>Cache: update memory
     Cache-->>App: success
     Worker->>Queue: consume batch
+    Note over Worker,DB: DB latency moved off user request path
     Worker->>DB: async flush
     DB-->>Worker: commit ok
 ```
@@ -98,10 +106,12 @@ sequenceDiagram
     participant DB as Database
 
     Client->>Cache: GET hot_key
+    Note over Client,Cache: user read stays cache-speed
     Cache-->>Client: cached value
     Note over Cache: TTL approaching refresh threshold
     Cache->>Refresher: schedule refresh
     Refresher->>DB: SELECT hot_key
+    Note over Refresher,DB: refresh latency paid in background
     DB-->>Refresher: fresh value
     Refresher->>Cache: SET hot_key fresh value new TTL
 ```
@@ -117,6 +127,16 @@ xychart-beta
     y-axis "Relative Latency" 0 --> 100
     bar [8, 75, 70, 15, 8]
 ```
+
+Interpretation:
+
+| Pattern | User-Visible Latency Shape |
+|---|---|
+| **Cache-aside hit** | One cache round trip |
+| **Cache-aside miss** | Cache miss plus database read plus cache fill |
+| **Write-through** | Cache write waits for database commit |
+| **Write-behind** | User waits for cache update and durable queue/WAL, not database flush |
+| **Refresh-ahead** | Hot reads stay fast because refresh work happens before expiry |
 
 ---
 
@@ -289,6 +309,51 @@ ARC tracks both:
 
 It adapts between LRU-like and LFU-like behavior based on workload. This helps when a workload alternates between scan-heavy access and stable hot-key access.
 
+### Eviction Behavior Under A Workload Shift
+
+Workload:
+
+1. Repeated hot keys: `A A A B B C A B C`
+2. Sudden full-table scan: `D E F G H I J K`
+3. Hot keys return: `A B C A B C`
+
+```text
+Cache capacity = 3
+
+Before scan:
+  LRU: [A B C]   LFU: [A B C]   ARC: [A B C]
+
+During scan D E F G H I J K:
+  LRU: [I J K]   scan evicts all hot keys
+  LFU: [A B C]   old frequency protects hot keys
+  ARC: [A B C]   adapts to protect frequency segment
+
+When hot keys return:
+  LRU: misses on A/B/C and must rebuild
+  LFU: hits A/B/C, but may retain old hot keys too long after popularity changes
+  ARC: usually keeps A/B/C while still adapting if the new pattern persists
+```
+
+```mermaid
+flowchart LR
+    Workload["Workload shift<br/>hot keys -> table scan -> hot keys"]
+    LRU["LRU<br/>great for recency<br/>weak against scans"]
+    LFU["LFU<br/>protects frequent keys<br/>slow to forget old popularity"]
+    ARC["ARC<br/>balances recent + frequent<br/>better mixed workload"]
+
+    Workload --> LRU
+    Workload --> LFU
+    Workload --> ARC
+
+    LRU -->|"scan fills cache with one-hit keys"| Misses["Hot keys miss after scan"]
+    LFU -->|"frequency protects old winners"| Hits["Hot keys survive"]
+    ARC -->|"adaptive target shifts"| Balanced["Scan resistance + adaptation"]
+
+    style Misses fill:#fee2e2,stroke:#dc2626
+    style Hits fill:#ecfdf5,stroke:#059669
+    style Balanced fill:#e8f4ff,stroke:#2563eb
+```
+
 ---
 
 ## 6. Production Code: Thread-Safe LRU Cache With TTL And Stats
@@ -338,6 +403,8 @@ class CacheStats:
     expirations: int
     size: int
     capacity: int
+    hit_ratio: float
+    miss_ratio: float
 
 
 class LRUCache(Generic[K, V]):
@@ -425,6 +492,9 @@ class LRUCache(Generic[K, V]):
 
     def stats(self) -> CacheStats:
         with self._lock:
+            total = self._hits + self._misses
+            hit_ratio = self._hits / total if total else 0.0
+            miss_ratio = self._misses / total if total else 0.0
             return CacheStats(
                 hits=self._hits,
                 misses=self._misses,
@@ -432,6 +502,8 @@ class LRUCache(Generic[K, V]):
                 expirations=self._expirations,
                 size=len(self._items),
                 capacity=self.capacity,
+                hit_ratio=hit_ratio,
+                miss_ratio=miss_ratio,
             )
 
     def keys_most_recent_first(self) -> list[K]:
@@ -497,46 +569,211 @@ if __name__ == "__main__":
     print(cache.stats())
 ```
 
+### Background Cleanup Thread Example
+
+Lazy expiration on `get` is usually enough for small caches, but large in-process caches often need maintenance so expired items do not occupy memory forever.
+
+```python
+from __future__ import annotations
+
+import threading
+import time
+from typing import TypeVar
+
+
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class CacheJanitor:
+    def __init__(
+        self,
+        cache: LRUCache[K, V],
+        *,
+        interval_seconds: float = 5.0,
+        max_items_per_pass: int = 1_000,
+    ) -> None:
+        self._cache = cache
+        self._interval_seconds = interval_seconds
+        self._max_items_per_pass = max_items_per_pass
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="cache-janitor", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self._interval_seconds + 1)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            removed = self._cache.cleanup_expired(max_items=self._max_items_per_pass)
+            if removed:
+                print(f"cache janitor removed {removed} expired entries")
+
+
+cache: LRUCache[str, bytes] = LRUCache(capacity=100_000, default_ttl_seconds=60)
+janitor = CacheJanitor(cache, interval_seconds=10)
+janitor.start()
+```
+
+Production note: maintenance threads must be bounded. A cleanup pass that scans millions of keys while holding a lock can create latency spikes worse than the memory waste it is trying to fix.
+
 ---
 
 ## 7. Cache Warm-Up Strategies
 
 Cold caches are predictable outages in disguise.
 
-| Strategy | How It Works | Risk |
-|---|---|---|
-| **Precompute hot keys during low traffic** | Load top objects before peak | Wasted work if predictions are wrong |
-| **Analytics-driven prediction** | Use yesterday's traffic, seasonality, launches | Can miss new viral objects |
-| **Background refresh after deployment** | Repopulate keys after cache flush or release | Can overload origin if not rate-limited |
-| **Canary warm-up** | Warm a small shard/region first | Slower global readiness |
-| **Stale restore** | Reload previous cache snapshot | Must avoid restoring invalid data |
+| Strategy | How It Works | Use When | Risk |
+|---|---|---|---|
+| **Precompute hot keys** | Load known hot objects during low traffic | Launch pages, product catalogs, celebrity profiles | Wasted work if predictions are wrong |
+| **Analytics-driven prediction** | Use top keys from yesterday, last hour, or seasonal traffic | Stable popularity patterns | Can miss new viral objects |
+| **Canary warm-up** | Warm one region/shard first, observe origin pressure, then expand | Deploys and migrations | Slower global readiness |
+| **Refresh-ahead** | Refresh keys before TTL expiry | Predictably hot keys with expensive regeneration | Background work can overload origin |
+| **Stale restore** | Restore a previous cache snapshot after restart/flush | Large caches where cold start is dangerous | Must avoid restoring invalid or sensitive data |
+| **Write-triggered warm-up** | On write, prefill derived read views | Reads frequently follow writes | Write path gets more complex |
+| **Tiered warm-up** | Warm L2/shared cache, then local L1 caches | Multi-layer cache systems | Coordination and observability get harder |
 
 > 🧠 **Staff-engineer note**  
 > Warm-up jobs need backpressure too. A cache warmer that ignores database health is just a scheduled stampede.
+
+### Simple Analytics-Driven Cache Warmer
+
+```python
+from __future__ import annotations
+
+import time
+from typing import Callable, Iterable, Protocol
+
+
+class CacheClient(Protocol):
+    def set(self, key: str, value: bytes, ttl_seconds: int) -> None:
+        ...
+
+
+def read_top_keys(path: str, limit: int) -> list[str]:
+    with open(path, "r", encoding="utf-8") as file:
+        return [line.strip() for line in file if line.strip()][:limit]
+
+
+def warm_cache_from_top_keys(
+    *,
+    top_keys_path: str,
+    limit: int,
+    fetch_from_origin: Callable[[str], bytes | None],
+    cache: CacheClient,
+    ttl_seconds: int,
+    max_origin_qps: float,
+) -> None:
+    delay = 1.0 / max_origin_qps
+
+    for key in read_top_keys(top_keys_path, limit):
+        started = time.monotonic()
+        value = fetch_from_origin(key)
+        if value is not None:
+            cache.set(key, value, ttl_seconds=ttl_seconds)
+
+        elapsed = time.monotonic() - started
+        sleep_for = max(0.0, delay - elapsed)
+        time.sleep(sleep_for)
+```
+
+The warmer is intentionally rate-limited. In production, also stop or slow it when database p99 latency, error rate, or replica lag crosses a threshold.
 
 ---
 
 ## 8. Crisis Management Decision Flow
 
 ```mermaid
-flowchart TD
-    Alert["High miss rate or DB spike"]
-    Exists["Are missed keys mostly nonexistent?"]
-    Expiry["Did many keys expire together?"]
-    HotKey["Are misses concentrated on one/few keys?"]
-    Penetration["Cache Penetration<br/>Mitigate: Bloom filter, negative caching, validation, rate limits"]
-    Avalanche["Cache Avalanche<br/>Mitigate: TTL jitter, staggered warmup, refresh-ahead, serve stale"]
-    Stampede["Cache Stampede<br/>Mitigate: leases, request coalescing, distributed lock, stale-while-revalidate"]
-    Capacity["General capacity issue<br/>Scale cache, tune TTLs, inspect eviction and memory pressure"]
+stateDiagram-v2
+    [*] --> Alert: page fires\nDB QPS high or cache hit rate low
+    Alert --> Stabilize: protect origin first
+    Stabilize --> Diagnose
 
-    Alert --> Exists
-    Exists -->|"Yes"| Penetration
-    Exists -->|"No"| Expiry
-    Expiry -->|"Yes"| Avalanche
-    Expiry -->|"No"| HotKey
-    HotKey -->|"Yes"| Stampede
-    HotKey -->|"No"| Capacity
+    state Stabilize {
+        [*] --> EnableRateLimits
+        EnableRateLimits --> ServeStale
+        ServeStale --> DisableWarmers
+        DisableWarmers --> [*]
+    }
+
+    Diagnose --> PenetrationCheck: are misses mostly nonexistent keys?
+    PenetrationCheck --> Penetration: yes
+    PenetrationCheck --> AvalancheCheck: no
+
+    AvalancheCheck --> Avalanche: did many keys expire together?
+    AvalancheCheck --> StampedeCheck: no
+
+    StampedeCheck --> Stampede: are misses concentrated on hot keys?
+    StampedeCheck --> CapacityCheck: no
+
+    CapacityCheck --> Capacity: cache CPU/memory/network saturated?
+    CapacityCheck --> BackendSlowness: no, origin slow or deploy issue
+
+    Penetration --> MitigatePenetration
+    Avalanche --> MitigateAvalanche
+    Stampede --> MitigateStampede
+    Capacity --> MitigateCapacity
+    BackendSlowness --> MitigateBackend
+
+    MitigatePenetration --> Recover
+    MitigateAvalanche --> Recover
+    MitigateStampede --> Recover
+    MitigateCapacity --> Recover
+    MitigateBackend --> Recover
+
+    Recover --> Verify: hit rate normal\nDB QPS normal\np99 normal
+    Verify --> Postmortem
+    Postmortem --> [*]
+
+    note right of MitigatePenetration
+      Add negative caching.
+      Enable Bloom filter.
+      Tighten validation.
+      Rate-limit bad clients.
+    end note
+
+    note right of MitigateAvalanche
+      Add TTL jitter.
+      Serve stale.
+      Stagger warm-up.
+      Refresh ahead.
+    end note
+
+    note right of MitigateStampede
+      Use leases.
+      Coalesce requests.
+      Lock regeneration.
+      Replicate hot keys.
+    end note
+
+    note right of MitigateCapacity
+      Add cache nodes.
+      Reduce object size.
+      Inspect eviction/slabs.
+      Shed low-priority traffic.
+    end note
+
+    note right of MitigateBackend
+      Roll back deploy.
+      Disable expensive path.
+      Reduce warmers/retries.
+      Route to stale fallback.
+    end note
 ```
+
+### Crisis Triage Checklist
+
+| Check | Fast Signal | Likely Diagnosis |
+|---|---|---|
+| Missed keys do not exist in DB | High 404/null lookup rate | Penetration |
+| Many TTLs expired in same minute | Miss spike matches TTL boundary | Avalanche |
+| One or few hot keys dominate misses | Hot-key dashboard or logs | Stampede |
+| Evictions spike while hit rate falls | Memory pressure, slab imbalance, object growth | Capacity |
+| Cache hit rate stable but p99 bad | Backend or network path issue | Not a cache miss crisis |
+| Warm-up or deploy just started | Origin QPS rises without user traffic rise | Self-inflicted load |
 
 ### Cache Penetration
 
@@ -578,20 +815,51 @@ Mitigate with:
 
 > **Prompt:** Design a distributed cache for a 10M QPS read-heavy workload with `< 5ms` p99 latency.
 
-In a strong answer, cover:
+### Rubric
 
-| Area | Expected Discussion |
-|---|---|
-| **API** | `get`, `set`, `delete`, batch get, TTL, compare-and-set if needed |
-| **Partitioning** | Consistent hashing, virtual nodes, hot-key mitigation |
-| **Replication** | Primary/replica cache nodes or client-side multi-read strategy |
-| **Latency** | In-memory storage, local region routing, connection pooling, UDP vs TCP trade-offs |
-| **Consistency** | Cache-aside invalidation, leases, stale serving, remote markers |
-| **Failure handling** | Gutter pools, circuit breakers, fallback to stale, DB protection |
-| **Eviction** | LRU/LFU/ARC, TTL, slab classes, memory fragmentation |
-| **Observability** | Hit rate, miss rate, evictions, hot keys, p99 latency, backend QPS |
-| **Backpressure** | Protect origin when cache is cold or failing |
-| **Security** | Tenant isolation, auth, encryption, key namespace controls |
+| Area | Acceptable Answer | Excellent Answer |
+|---|---|---|
+| **API** | Supports `get`, `set`, `delete`, TTL | Adds batch get, namespace/versioned keys, compare-and-set where needed, negative caching, and explicit stale reads |
+| **Partitioning** | Uses consistent hashing across cache nodes | Adds virtual nodes, weighted nodes, hot-key replication, shard maps, and controlled rebalancing |
+| **Replication** | Has replicas or multiple cache pools | Distinguishes cache replication from source-of-truth replication; explains local region reads, cross-region markers, and failure domains |
+| **Latency** | Keeps cache in memory and close to callers | Discusses p99 budget, connection pooling, binary protocol, UDP vs TCP trade-offs, kernel/network overhead, and avoiding large values |
+| **Consistency** | Uses TTL and invalidation | Explains cache-aside invalidation race, leases, stale-while-revalidate, remote markers, versioned values, and write-through/write-behind trade-offs |
+| **Failure handling** | Falls back to database on miss | Protects database with circuit breakers, stale fallback, gutter pools, request coalescing, rate limits, and origin QPS budgets |
+| **Eviction** | Chooses LRU or TTL | Compares LRU/LFU/ARC, object size classes, fragmentation, scan resistance, admission policy, and per-tenant fairness |
+| **Observability** | Tracks hit rate and latency | Adds miss reason, hot keys, evictions by cause, memory/slab pressure, origin QPS, lease wait time, stale served count, and per-tenant dashboards |
+| **Backpressure** | Rate-limits clients | Adds warmer throttling, miss-budget enforcement, fail-open/fail-closed policy, queue limits, and graceful degradation |
+| **Security** | Mentions auth and encryption | Adds tenant key isolation, key namespace controls, encryption in transit, abuse prevention, and avoiding sensitive data in shared caches |
+
+### Reference Architecture Sketch
+
+```mermaid
+flowchart LR
+    Apps["App Servers"]
+    Router["Cache Router<br/>consistent hash + batching"]
+    Hot["Hot-Key Detector"]
+    PoolA["Cache Pool A"]
+    PoolB["Cache Pool B"]
+    Gutter["Gutter Pool"]
+    Origin["Origin DB / Service"]
+    Metrics["Metrics + Tracing"]
+    Warmer["Rate-Limited Warmer"]
+
+    Apps --> Router
+    Router --> PoolA
+    Router --> PoolB
+    Router -. failed node keys .-> Gutter
+    Router --> Metrics
+    PoolA --> Hot
+    PoolB --> Hot
+    Hot -->|"replicate hot keys"| PoolA
+    Hot -->|"replicate hot keys"| PoolB
+    PoolA -->|"miss budget allows"| Origin
+    PoolB -->|"miss budget allows"| Origin
+    Warmer --> Router
+    Warmer -. watches DB health .-> Origin
+```
+
+The excellent answer is not "put Redis in front of the DB." It is a design that keeps the origin alive when the cache is cold, partial, overloaded, or wrong.
 
 ---
 
