@@ -2,409 +2,425 @@
 
 Traffic routing is the front door of a distributed system.
 
-Before a request reaches your application code, it may pass through **DNS**, **Anycast routing**, **CDNs**, **load balancers**, **reverse proxies**, **TLS termination**, **rate limiters**, and **backend connection pools**. Each layer makes a trade-off between **latency**, **cost**, **control**, **security**, and **availability**.
+Before a request reaches application code, it may pass through **DNS**, **Anycast routing**, **CDNs**, **L4 load balancers**, **L7 reverse proxies**, **TLS termination**, **rate limiters**, and **backend connection pools**. Each layer trades latency, availability, cost, security, and operational control.
 
-This chapter turns the raw theory into an interview-ready and production-minded foundation for designing systems that survive real traffic.
+This module is a visual, interview-ready guide to how traffic reaches your system and how edge infrastructure fails under real load.
+
+---
+
+## Visual Glossary
+
+| Icon | Term | Interview Definition |
+|---|---|---|
+| 🌍 | **Anycast** | One IP advertised from many locations; routing sends users to a nearby healthy edge |
+| ⚡ | **CDN** | Distributed cache that serves content close to users and protects origin servers |
+| 📦 | **Layer 4** | Transport-level routing using IPs, ports, TCP/UDP metadata |
+| 🔍 | **Layer 7** | Application-level routing using HTTP host, path, headers, cookies, body metadata |
+| 🔒 | **TLS termination** | Edge decrypts HTTPS, inspects request, and opens a separate backend connection |
+| 🚦 | **Rate limiting** | Controls request volume using counters, buckets, quotas, or adaptive policy |
 
 ---
 
 ## Learning Goals
 
-By the end of this module, you should be able to:
+By the end of this module, you should be able to explain:
 
-| Skill | What You Should Be Able To Explain |
+| Skill | What You Should Be Able To Teach |
 |---|---|
-| **DNS routing** | How users are directed to the right region or edge location |
-| **CDN behavior** | Why push and pull CDNs have different cost, freshness, and origin-load profiles |
-| **L4 vs. L7 load balancing** | How packet forwarding differs from request-aware routing |
-| **TCP termination** | Why L7 routing requires more CPU and memory than simple L4 NAT |
-| **Reverse proxy duties** | How NGINX-style proxies terminate TLS, compress responses, and isolate backends |
-| **Edge protection** | How rate limiting blocks abusive traffic before it reaches application servers |
-| **Failure modes** | How thundering herds and split-brain failovers take down otherwise healthy systems |
+| **DNS resolution** | Recursive resolver, root, TLD, authoritative DNS, TTLs, and Anycast |
+| **L4 vs. L7 routing** | Header visibility, TCP termination, NAT, and request-aware routing |
+| **CDN strategies** | Push vs. pull, origin shield, stale-while-revalidate, and thundering-herd control |
+| **Reverse proxies** | TLS termination, compression, routing, isolation, and observability |
+| **Rate limiting** | Token bucket mechanics and edge abuse prevention |
+| **Failure modes** | Cache stampedes, split-brain failover, origin overload, and stale data |
+| **Interview trade-offs** | When each networking layer is useful and when it is unnecessary |
 
 ---
 
-## 1. The Request Path: From Browser To Backend
+## 1. DNS Resolution And Anycast
 
-A modern request typically follows this journey:
+DNS translates a name such as `api.example.com` into an address clients can connect to. At scale, DNS is also a traffic steering system.
 
-1. The **browser asks DNS** for the IP address of a domain.
-2. DNS routing returns an endpoint based on **Anycast**, **geography**, **latency**, or configured weights.
-3. The user connects to an **edge load balancer** or **API gateway**.
-4. The edge decides whether to forward packets at **Layer 4** or terminate and inspect the request at **Layer 7**.
-5. The request is routed to a backend service.
-6. The response may be compressed, cached, encrypted, and returned to the user.
-
-### Native Architecture Diagram
+### DNS Resolution Sequence
 
 ```mermaid
-flowchart LR
-    User["User Browser"]
-    Resolver["Recursive DNS Resolver"]
-    AnycastDNS["Anycast DNS Edge<br/>Nearest healthy DNS node answers"]
-    EdgeIP["Returned Edge IP<br/>api.example.com -> 203.0.113.10"]
+sequenceDiagram
+    participant B as Browser
+    participant R as Recursive Resolver<br/>(ISP/Public DNS)
+    participant Root as Root DNS
+    participant TLD as .com TLD DNS
+    participant Auth as Authoritative DNS<br/>example.com
+    participant EdgeA as Anycast Edge A
+    participant EdgeB as Anycast Edge B
 
-    subgraph Edge["Edge Ingress"]
-        Gateway["API Gateway / L7 Load Balancer<br/>Terminates TCP/TLS, reads HTTP"]
-        L4LB["Layer 4 Load Balancer<br/>NAT only, no HTTP inspection"]
-    end
+    Note over EdgeA,EdgeB: Both advertise 203.0.113.10 via BGP Anycast
 
-    subgraph L7Path["Layer 7 Path: TCP Termination"]
-        Parse["Inspect request<br/>Host, path, method, headers, cookies"]
-        RouteAPI["/api/* -> API Service"]
-        RouteMedia["/media/* -> Media Service"]
-        API["API Backend Pool"]
-        Media["Media Backend Pool"]
-    end
+    B->>R: What is api.example.com?
+    R->>Root: Resolve .com
+    Root-->>R: Ask .com TLD
+    R->>TLD: Resolve example.com
+    TLD-->>R: Ask authoritative DNS
+    R->>Auth: Resolve api.example.com
+    Auth-->>R: A 203.0.113.10, TTL=60
+    R-->>B: 203.0.113.10
 
-    subgraph L4Path["Layer 4 Path: NAT Routing"]
-        NAT["Rewrite destination IP:port<br/>Keep payload opaque"]
-        TCPPool["Generic TCP Backend Pool"]
-    end
-
-    User -->|"1. DNS query"| Resolver
-    Resolver -->|"2. Routed by BGP Anycast"| AnycastDNS
-    AnycastDNS -->|"3. DNS answer"| EdgeIP
-    EdgeIP -->|"4. Client opens TCP/TLS connection"| User
-
-    User -->|"HTTPS request to edge IP"| Gateway
-    User -.->|"TCP/UDP flow to edge IP"| L4LB
-
-    Gateway -->|"5a. Terminate client connection"| Parse
-    Parse -->|"Path rule"| RouteAPI
-    Parse -->|"Path rule"| RouteMedia
-    RouteAPI -->|"6a. New TCP connection from gateway"| API
-    RouteMedia -->|"6b. New TCP connection from gateway"| Media
-
-    L4LB -->|"5b. Packet forwarding only"| NAT
-    NAT -->|"6c. Rewritten packets"| TCPPool
-
-    API -->|"Response"| Gateway
-    Media -->|"Response"| Gateway
-    TCPPool -.->|"Response packets via NAT table"| L4LB
-    Gateway -->|"Compress, encrypt, return"| User
-    L4LB -.->|"Rewrite source IP:port, return"| User
+    B->>EdgeA: TCP/TLS to 203.0.113.10
+    Note over B,EdgeA: Internet routing chooses nearby Anycast edge
 ```
-
----
-
-## 2. Layer 4 vs. Layer 7 Load Balancing
-
-Load balancers distribute traffic across backend servers. The layer they operate at determines what they can see and what decisions they can make.
-
-### Layer 4: Transport-Level Routing
-
-A **Layer 4 load balancer** operates on TCP or UDP metadata:
-
-- Source IP
-- Source port
-- Destination IP
-- Destination port
-- Protocol
-
-It does **not** read HTTP headers, cookies, paths, request bodies, or application messages.
-
-The common implementation model is **Network Address Translation (NAT)**:
-
-1. The client opens a TCP connection to the load balancer IP.
-2. The load balancer chooses a backend.
-3. It rewrites the packet destination from `LB_IP:443` to `BACKEND_IP:443`.
-4. Responses are rewritten in the opposite direction.
-5. The packet payload remains opaque.
-
-### Layer 7: Application-Level Routing
-
-A **Layer 7 load balancer** understands application protocols such as HTTP.
-
-It can route based on:
-
-| Routing Signal | Example |
-|---|---|
-| **Host header** | `api.example.com` vs. `admin.example.com` |
-| **URL path** | `/payments/*` vs. `/search/*` |
-| **HTTP method** | `GET` vs. `POST` |
-| **Cookies** | `session_id=abc123` for sticky sessions |
-| **Headers** | `X-Tenant-ID`, `Authorization`, `User-Agent` |
-| **Request body** | Usually avoided at the edge unless necessary because it adds latency and memory pressure |
-
-To inspect those fields, the L7 load balancer must first perform **TCP termination**.
-
----
-
-## 3. TCP Termination: The Core Difference
-
-**TCP termination** means the load balancer ends the client-side TCP connection at itself.
-
-With Layer 7 routing, there is no single end-to-end TCP connection from browser to backend. There are two separate connections:
-
-| Connection | Owned By | Purpose |
-|---|---|---|
-| **Client -> Load Balancer** | Browser and L7 load balancer | Accept user traffic, terminate TCP/TLS, read HTTP |
-| **Load Balancer -> Backend** | L7 load balancer and backend server | Forward the request over a new upstream connection |
-
-### Why L7 Costs More Than L4
-
-Layer 4 NAT is comparatively cheap because it mostly maintains a connection table and rewrites packet headers.
-
-Layer 7 termination requires more work:
-
-| Cost Area | Why It Increases |
-|---|---|
-| **CPU** | TLS handshakes, encryption/decryption, HTTP parsing, header processing, compression |
-| **Memory** | Two connection states, request buffers, response buffers, routing metadata |
-| **Latency** | Extra processing before forwarding, plus possible upstream connection setup |
-| **Operational complexity** | Certificate management, header trust boundaries, retries, timeouts, observability |
-
-The exact latency impact depends on implementation and hardware. On modern edge infrastructure, the overhead can be small, often in the low milliseconds or less for optimized paths. But it is never free. The trade-off is **more intelligent routing in exchange for more work at the edge**.
-
-### Teaching Analogy: Mailroom vs. Executive Assistant
-
-Use this analogy with junior engineers:
-
-| Load Balancer Type | Analogy | Behavior |
-|---|---|---|
-| **Layer 4** | Mailroom worker | Looks only at the envelope, keeps it sealed, and forwards it to a destination bin |
-| **Layer 7** | Executive assistant | Opens the envelope, reads the message, decides who should handle it, then sends a new message onward |
-
-The mailroom is faster because it does not understand the content. The assistant is slower but can make smarter decisions.
-
----
-
-## 4. Comparison: L4 vs. L7
-
-| Dimension | Layer 4 Load Balancer | Layer 7 Load Balancer |
-|---|---|---|
-| **OSI layer** | Transport | Application |
-| **Primary data inspected** | IPs and ports | HTTP host, path, headers, cookies, method |
-| **Connection model** | Packet forwarding or NAT | TCP/TLS termination plus new backend connection |
-| **Protocol awareness** | Protocol-agnostic | Protocol-aware |
-| **Typical performance** | Highest throughput, lowest per-request overhead | Lower throughput, richer control |
-| **Sticky sessions** | Usually source IP hash | Cookie, header, tenant ID, authenticated identity |
-| **Best for** | Generic TCP/UDP, extreme throughput, simple backend pools | APIs, microservices, request-aware routing, edge security |
-| **Common products** | LVS, AWS NLB, GCP TCP/UDP LB | NGINX, Envoy, HAProxy HTTP mode, AWS ALB, API gateways |
-
-### Decision Rule
-
-Use **Layer 4** when all backends are interchangeable and performance is the dominant requirement.
-
-Use **Layer 7** when routing decisions require application context.
-
----
-
-## 5. DNS Routing At The Edge
-
-DNS translates names such as `api.example.com` into IP addresses. Modern DNS also helps decide **which edge location** receives a user.
 
 ### DNS Routing Methods
 
 | Method | How It Works | Strength | Risk |
 |---|---|---|---|
-| **Anycast** | Multiple locations advertise the same IP. BGP routes the user to a nearby network location. | Fast global routing and simple client configuration | BGP changes can shift traffic unexpectedly |
-| **Geolocation routing** | DNS answers based on the user's inferred geography | Good for compliance, regionalization, and coarse latency control | IP geolocation can be wrong, especially with VPNs and mobile networks |
-| **Latency-based routing** | DNS selects the endpoint with the best measured latency | Better user performance when geography is not enough | Requires accurate health and latency measurements |
-| **Weighted routing** | DNS distributes traffic by configured percentages | Useful for migrations, canaries, and regional balancing | DNS caching means the split is approximate |
-| **Failover routing** | DNS returns a secondary endpoint when health checks fail | Simple disaster recovery | Failover is limited by DNS TTL and resolver caching |
+| **Anycast** | Many locations advertise the same IP through BGP | Simple global entry point, fast edge routing | Route changes can shift traffic unexpectedly |
+| **Geolocation** | DNS answers based on inferred client geography | Compliance and regional routing | VPN/mobile IPs can be inaccurate |
+| **Latency-based** | DNS chooses endpoint based on measured latency | Better performance than geography alone | Requires health and latency telemetry |
+| **Weighted routing** | DNS distributes traffic by configured weights | Canary, migration, traffic shaping | Resolver caching makes splits approximate |
+| **Failover routing** | DNS returns backup endpoint when primary is unhealthy | Simple recovery pattern | Recovery speed limited by TTL and resolver behavior |
 
-### TTL: The Hidden Control Knob
-
-**TTL (Time-To-Live)** tells resolvers how long to cache a DNS answer.
-
-| TTL Choice | Benefit | Trade-Off |
-|---|---|---|
-| **Short TTL** | Faster failover and migrations | More DNS query load and less cache efficiency |
-| **Long TTL** | Lower DNS load and stable caching | Slower recovery from bad endpoints |
-
-For changing infrastructure, keep TTLs short. For stable endpoints, longer TTLs reduce DNS overhead.
+> 🧠 **Staff-engineer note**  
+> DNS failover is not instant. Even with a short TTL, clients and recursive resolvers may cache answers. For critical services, pair DNS steering with load balancer health checks and client retry behavior.
 
 ---
 
-## 6. Content Delivery Networks
+## 2. L4 vs. L7 Packet Flow
 
-A **Content Delivery Network (CDN)** is a distributed network of edge caches that serves content closer to users.
+The most important interview distinction: **Layer 4 routes connections; Layer 7 routes requests**.
 
-CDNs reduce:
+### L4 vs. L7 Header Visibility
 
-- User-perceived latency
-- Origin server load
-- Transit bandwidth
-- Blast radius during traffic spikes
+```mermaid
+flowchart LR
+    Client["Client"]
 
-They are especially useful for:
+    subgraph Packet["Incoming Network Packet"]
+        IP["IP Header<br/>src=198.51.100.5<br/>dst=203.0.113.10"]
+        TCP["TCP Header<br/>src_port=51514<br/>dst_port=443"]
+        TLS["TLS Record<br/>encrypted bytes"]
+        HTTP["HTTP Request<br/>GET /api/orders<br/>Host: api.example.com<br/>Cookie: session=abc"]
+    end
 
-- Images
-- JavaScript bundles
-- CSS
-- Video segments
-- Downloads
-- Public HTML pages that can tolerate caching
+    subgraph L4["📦 L4 Load Balancer"]
+        L4See["Sees IP + TCP/UDP metadata"]
+        NAT["NAT / direct server return<br/>dst -> backend_ip:443"]
+        L4Blind["Does not inspect HTTP path, host, or cookie"]
+    end
 
-### Push CDN vs. Pull CDN
+    subgraph L7["🔍 L7 Proxy / API Gateway"]
+        Terminate["Terminates TCP/TLS"]
+        Parse["Parses HTTP headers/path/cookies"]
+        Route["Routes /api/orders<br/>to Orders Service"]
+        NewConn["Opens new backend TCP connection"]
+    end
+
+    Client --> IP --> TCP --> TLS --> HTTP
+    TCP --> L4See --> NAT --> L4Blind
+    HTTP --> Terminate --> Parse --> Route --> NewConn
+
+    style L4 fill:#e8f4ff,stroke:#2563eb
+    style L7 fill:#ecfdf5,stroke:#059669
+```
+
+### Layer 4: Transport Routing
+
+An L4 load balancer uses:
+
+- Source IP and port.
+- Destination IP and port.
+- Protocol.
+- Connection state.
+
+It usually performs **NAT** or a related packet-forwarding technique. It does not need to decrypt TLS or understand HTTP.
+
+Best fit:
+
+- Extreme throughput.
+- Generic TCP/UDP.
+- Internal service pools with identical backends.
+- Protocols that are not HTTP.
+
+### Layer 7: Application Routing
+
+An L7 load balancer or reverse proxy can use:
+
+- HTTP host.
+- URL path.
+- Method.
+- Headers.
+- Cookies.
+- Tenant ID.
+- Auth context.
+
+Best fit:
+
+- API gateways.
+- Microservice routing.
+- Header/cookie-based routing.
+- WAF, auth, compression, retries, observability.
+
+### Decision Matrix
+
+| Dimension | Layer 4 Load Balancer | Layer 7 Load Balancer |
+|---|---|---|
+| **Primary data inspected** | IPs, ports, protocol | HTTP host, path, headers, cookies |
+| **Connection model** | Packet forwarding/NAT | Client connection terminated, new backend connection |
+| **Protocol support** | TCP/UDP and non-HTTP protocols | HTTP/gRPC/WebSocket-aware, depending proxy |
+| **Latency overhead** | Lowest | Higher due to parsing/TLS/policy |
+| **Throughput ceiling** | Very high | Lower than L4 under equal hardware |
+| **Routing intelligence** | Low | High |
+| **Sticky sessions** | Usually source IP hash | Cookie/header/session-aware |
+| **Use when** | You need speed and simple distribution | You need request-aware control |
+
+---
+
+## 3. TCP/TLS Termination Overhead
+
+**TCP termination** means the proxy ends the client-side connection at itself. If HTTPS is used, the proxy also performs **TLS termination**, decrypts the request, and then opens a separate upstream connection.
+
+### What L7 Adds
+
+| Cost Area | Why It Increases |
+|---|---|
+| **CPU** | TLS handshake, encryption/decryption, HTTP parsing, compression, policy checks |
+| **Memory** | Client connection state, upstream connection state, buffers, routing metadata |
+| **Latency** | Parsing and policy work before forwarding; possible upstream connection setup |
+| **Operational surface** | Certificates, headers, timeouts, retries, observability, auth, WAF rules |
+
+### Rough Operating Numbers
+
+These are order-of-magnitude interview numbers, not vendor guarantees.
+
+| Item | Rough Range | Notes |
+|---|---:|---|
+| TCP handshake | 1 network RTT | Avoid with connection reuse |
+| TLS 1.3 full handshake | ~1 RTT after TCP, often thousands to tens of thousands of CPU cycles with modern crypto | Depends on cipher, key exchange, hardware, session resumption |
+| TLS session resumption | Often 0-1 RTT | Much cheaper than full handshake |
+| Idle TCP connection memory | ~10 KB to 100+ KB per connection | Kernel buffers and proxy state vary widely |
+| L4 forwarding overhead | Microseconds to low sub-millisecond on optimized paths | Kernel/eBPF/hardware offload can help |
+| L7 proxy overhead | Sub-millisecond to several milliseconds | Depends on TLS, filters, body buffering, auth, logging |
+
+> 🧠 **Staff-engineer note**  
+> The real killer is often not one request. It is concurrency. One million idle connections at 32 KB each is ~32 GB of memory before application buffers, TLS state, and observability overhead.
+
+### Throughput vs. Concurrency Shape
+
+```mermaid
+xychart-beta
+    title "Throughput Shape: L4 NAT vs L7 Proxy"
+    x-axis "Concurrent Connections" [1k, 10k, 50k, 100k, 500k, 1M]
+    y-axis "Relative Throughput" 0 --> 100
+    line "L4 NAT" [100, 98, 94, 89, 75, 58]
+    line "L7 Proxy" [92, 86, 72, 58, 35, 18]
+```
+
+Interpretation: L7 gives more control, but connection state, TLS, parsing, and filters consume more resources as concurrency rises.
+
+---
+
+## 4. CDN Strategies
+
+A CDN serves cacheable content from edge locations close to users. It reduces latency and protects origins.
+
+### Push CDN vs. Pull CDN With Origin Shield
+
+```mermaid
+flowchart TB
+    subgraph Push["Push CDN"]
+        Publisher["Publisher / Build Pipeline"]
+        PushAPI["CDN Upload API"]
+        PushEdge1["Edge Cache A"]
+        PushEdge2["Edge Cache B"]
+        PushEdge3["Edge Cache C"]
+        PushUser["Users"]
+
+        Publisher --> PushAPI
+        PushAPI --> PushEdge1
+        PushAPI --> PushEdge2
+        PushAPI --> PushEdge3
+        PushEdge1 --> PushUser
+        PushEdge2 --> PushUser
+        PushEdge3 --> PushUser
+    end
+
+    subgraph Pull["Pull CDN + Origin Shield"]
+        PullUser["Users"]
+        PullEdge1["Edge Cache A"]
+        PullEdge2["Edge Cache B"]
+        Shield["Origin Shield<br/>regional cache layer"]
+        Origin["Origin Server / Object Store"]
+
+        PullUser --> PullEdge1
+        PullUser --> PullEdge2
+        PullEdge1 -->|"miss"| Shield
+        PullEdge2 -->|"miss"| Shield
+        Shield -->|"shield miss only"| Origin
+        Origin --> Shield
+        Shield --> PullEdge1
+        Shield --> PullEdge2
+    end
+
+    style Push fill:#e8f4ff,stroke:#2563eb
+    style Pull fill:#ecfdf5,stroke:#059669
+```
 
 | Dimension | Push CDN | Pull CDN |
 |---|---|---|
-| **How content arrives** | You upload content to the CDN ahead of time | CDN fetches from origin on first request or after expiry |
-| **Origin load** | Low after upload | Higher during cache misses and revalidation |
-| **First request latency** | Low if already distributed | Higher because the CDN must fetch from origin |
-| **Storage cost** | Higher because content is stored whether requested or not | Lower because popular content naturally fills cache |
-| **Best fit** | Predictable static assets, software releases, large media libraries | High-traffic sites, unpredictable access, frequently requested content |
-| **Cache invalidation** | Explicit upload, purge, or versioning workflow | TTL-driven, purge-driven, or revalidation-driven |
+| **How content arrives** | Uploaded before request | Fetched from origin on miss |
+| **First request latency** | Low if pre-distributed | Higher on cold miss |
+| **Origin load** | Low after upload | Depends on cache miss and revalidation rate |
+| **Storage cost** | Higher for unused assets | Lower because demand fills cache |
+| **Invalidation** | Deploy/purge/version workflow | TTL, purge, revalidation |
+| **Best for** | Known static assets, releases, game patches | Images, pages, unpredictable demand |
 
-### Practical CDN Strategy For A News Site
+### Thundering Herd: Stale-While-Revalidate
 
-A high-traffic news site should usually use a **hybrid strategy**:
+When a hot object expires everywhere at once, many edge nodes can revalidate at the same time. A shield cache and stale serving prevent origin collapse.
 
-| Asset Type | CDN Strategy | TTL | Rationale |
-|---|---|---:|---|
-| **Article HTML** | Pull CDN | 30 to 300 seconds | Keeps content reasonably fresh while reducing repeated origin hits |
-| **Images** | Push or pull with immutable filenames | Hours to days | Images rarely change and can be cached aggressively |
-| **CSS and JavaScript** | Push or pull with content-hashed filenames | Months to 1 year | Versioned filenames make long TTLs safe |
-| **Breaking news pages** | Pull CDN with purge support | Seconds to minutes | Editors may need fast invalidation |
+```mermaid
+sequenceDiagram
+    participant U as Many Users
+    participant E as CDN Edge
+    participant S as Origin Shield
+    participant O as Origin
 
-The key is not "push or pull." The key is matching **cache behavior** to **content volatility**.
+    U->>E: Request hot object after TTL
+    E->>E: Object stale but usable
+    E-->>U: Serve stale immediately
+    E->>S: One background revalidation
+    S->>O: Conditional GET / If-None-Match
+    O-->>S: 304 Not Modified or new object
+    S-->>E: Refreshed metadata/object
+    Note over E,O: Users avoid waiting and origin avoids a request storm
+```
 
 ---
 
-## 7. Reverse Proxies And Edge Security
+## 5. Rate Limiting
 
-A **reverse proxy** sits in front of internal services and presents a controlled public interface.
+Rate limiting is an edge safety mechanism. It protects services from abusive clients, accidental loops, and bursty tenants.
 
-NGINX, Envoy, HAProxy, and many API gateways can act as reverse proxies.
+### Token Bucket Timeline
 
-### Structural Responsibilities
+```mermaid
+flowchart LR
+    Start["Bucket capacity=5<br/>refill=1 token/sec"]
+    T0["t=0<br/>tokens=5<br/>request burst: 4<br/>allowed=4<br/>left=1"]
+    T1["t=1<br/>refill +1<br/>tokens=2<br/>request: 3<br/>allowed=2<br/>rejected=1"]
+    T2["t=2<br/>refill +1<br/>tokens=1<br/>request: 1<br/>allowed=1<br/>left=0"]
+    T5["t=5<br/>refill over time<br/>tokens=3<br/>request: 2<br/>allowed=2"]
 
-| Responsibility | What It Does | Why It Matters |
+    Start --> T0 --> T1 --> T2 --> T5
+```
+
+| Algorithm | Behavior | Best For |
 |---|---|---|
-| **TLS/SSL termination** | Decrypts client HTTPS at the edge | Centralizes certificate management and offloads crypto from app servers |
-| **Request routing** | Sends requests to services based on host, path, headers, or cookies | Enables microservice routing without exposing internal topology |
-| **Compression** | Applies gzip or Brotli to text responses | Reduces bandwidth and improves perceived latency |
-| **Connection pooling** | Reuses upstream connections to backends | Reduces handshake overhead and backend connection churn |
-| **Security isolation** | Hides private IPs, ports, and service names | Limits what attackers can directly reach |
-| **Request normalization** | Enforces header size, body size, and timeout limits | Blocks malformed or abusive traffic early |
-| **Observability** | Emits access logs, latency histograms, and routing metadata | Makes traffic behavior measurable |
+| **Fixed window** | Count requests in fixed time buckets | Simple quotas |
+| **Sliding window** | Smooths boundary effects | Fair client throttling |
+| **Token bucket** | Allows bursts up to bucket capacity | APIs with short bursts |
+| **Leaky bucket** | Smooths traffic to steady drain rate | Traffic shaping |
 
-### Edge Rate Limiting
+> ⚠️ **Failure mode**  
+> Rate limits by source IP can punish many legitimate users behind one NAT. For authenticated APIs, prefer user ID, tenant ID, API key, or token fingerprint as the primary limiter.
 
-**Edge rate limiting** blocks floods before they consume application capacity.
+---
 
-At the edge, a proxy can maintain counters by:
+## 6. Reverse Proxies And Edge Security
 
-- Source IP
-- API key
-- User ID
-- Tenant ID
-- Route
-- Country or ASN
-- Auth token fingerprint
+A reverse proxy sits in front of internal services and exposes a controlled public interface.
 
-Common algorithms:
+### Responsibilities
 
-| Algorithm | How It Works | Best For |
+| Responsibility | What It Does |
+|---|---|
+| **TLS termination** | Decrypts client HTTPS and manages certificates centrally |
+| **Routing** | Sends traffic based on host, path, headers, cookies |
+| **Compression** | Applies gzip/Brotli where useful |
+| **Connection pooling** | Reuses backend connections |
+| **Security isolation** | Hides internal IPs, ports, and service names |
+| **Policy enforcement** | Auth, WAF, rate limits, request size limits |
+| **Observability** | Emits access logs, latency histograms, error rates |
+
+### When Not To Use A Reverse Proxy
+
+Reverse proxies are powerful, but they are not free.
+
+Use direct client-to-backend or simpler routing when:
+
+| Scenario | Why A Reverse Proxy May Be Wrong |
+|---|---|
+| **Internal gRPC with mTLS and service mesh** | Mesh sidecars or client libraries may already handle identity, retries, telemetry |
+| **WebRTC media** | Real-time media often needs direct peer/SFU paths; proxying can add latency and jitter |
+| **High-throughput binary TCP service** | L7 proxy cannot inspect protocol and only adds overhead |
+| **Private batch jobs inside one trusted network** | Direct service discovery plus mTLS may be simpler |
+| **Ultra-low-latency trading or telemetry paths** | Every hop and buffer matters |
+
+> 🧠 **Staff-engineer note**  
+> The reverse proxy is a control point. If you do not need the control, do not pay the latency, operational, and failure-domain cost.
+
+---
+
+## 7. Real-World Case Studies
+
+### Cloudflare: Anycast + L7 Edge
+
+Cloudflare-style architecture places a reverse-proxy edge close to users, using Anycast routing to attract traffic to nearby locations. At the edge, L7 services can terminate TLS, apply WAF/rate-limit rules, cache content, and proxy to origin.
+
+**Interview takeaway:** Anycast solves the global entry problem; L7 edge logic solves the application policy problem.
+
+### AWS Global Accelerator vs. API Gateway
+
+| Product Shape | Layer Bias | Use Case |
 |---|---|---|
-| **Fixed window** | Counts requests in fixed time buckets | Simple enforcement |
-| **Sliding window** | Smooths limits across moving time ranges | Fairer user experience |
-| **Token bucket** | Refills tokens over time and spends one per request | Allows controlled bursts |
-| **Leaky bucket** | Processes requests at a steady rate | Traffic shaping |
+| **AWS Global Accelerator** | L4/global networking bias with static anycast IPs | Improve global routing to regional endpoints such as ALB/NLB/EC2 |
+| **Amazon API Gateway** | L7 API management | REST/HTTP/WebSocket APIs, auth, throttling, routing to Lambda or HTTP backends |
 
-The point is architectural: malicious or accidental floods should be rejected at the edge with `429 Too Many Requests` or blocked before application servers, databases, and queues are forced to do expensive work.
+**Interview takeaway:** Global Accelerator gets clients onto a provider backbone and routes to healthy endpoints. API Gateway understands API requests and policies.
 
----
+### Fastly/CloudFront-Style CDN: Thundering Herd
 
-## 8. Real-World Failure Modes
+Modern CDNs mitigate origin overload using techniques such as:
 
-### Failure Mode 1: Pull CDN Thundering Herd
+- Origin shield / tiered cache.
+- Request coalescing.
+- `stale-while-revalidate`.
+- `stale-if-error`.
+- Conditional revalidation with ETags.
 
-A **thundering herd** happens when many clients request the same expired object at nearly the same time.
-
-Example:
-
-1. A celebrity news image goes viral.
-2. The CDN caches it for 5 minutes.
-3. The TTL expires.
-4. A huge number of edge nodes or users request the same asset at once.
-5. The CDN treats the object as stale and sends many fetches to the origin.
-6. The origin is crushed by redundant requests for the same content.
-
-This is dangerous because the backend may fail even though the content did not change.
-
-#### Mitigations
-
-| Mitigation | How It Helps |
-|---|---|
-| **Request coalescing / collapsed forwarding** | Only one edge request refreshes the object while others wait |
-| **Stale-while-revalidate** | Serve stale content briefly while the CDN refreshes in the background |
-| **Soft TTL plus hard TTL** | Refresh proactively before the object fully expires |
-| **Cache warming** | Preload viral or predictable assets before traffic arrives |
-| **Content-hashed URLs** | Avoid invalidating unchanged assets by naming files after their content |
-| **Origin shielding** | Route CDN misses through a smaller set of shield caches before origin |
-
-### Failure Mode 2: Split-Brain In Active-Passive Load Balancers
-
-In an **active-passive** setup, one load balancer owns the virtual IP while the other waits.
-
-They coordinate using a **heartbeat**.
-
-Split-brain occurs when:
-
-1. The active load balancer is still alive.
-2. The heartbeat network fails.
-3. The passive node stops hearing heartbeats.
-4. The passive node assumes the active node is dead.
-5. Both nodes try to own the same virtual IP or serve as primary.
-
-The result can be duplicate ownership, inconsistent routing, connection drops, and difficult-to-debug partial outages.
-
-#### Mitigations
-
-| Mitigation | Why It Helps |
-|---|---|
-| **Quorum or consensus** | Prevents one isolated node from promoting itself incorrectly |
-| **Fencing** | Forces the old primary offline before the standby takes over |
-| **Independent health checks** | Confirms failure from more than one network path |
-| **Redundant heartbeat links** | Reduces false failover due to a single network failure |
-| **Active-active architecture** | Avoids single-owner promotion, but adds state and routing complexity |
+**Interview takeaway:** The CDN should collapse many edge misses into one origin request.
 
 ---
 
-## 9. Production Code Template: Layer 7 Path Router
+## 8. Production Code Template: L7 Proxy With Metrics And Circuit Breakers
 
-The following TypeScript template uses Node.js standard HTTP libraries. It demonstrates a conceptual but production-shaped Layer 7 reverse proxy:
-
-- Path-based routing
-- Least-outstanding-request backend selection
-- Health checks
-- Header forwarding
-- Timeouts
-- Connection accounting
-- Graceful shutdown
-
-It is intentionally small enough to study, but structured like infrastructure code you could evolve.
+This TypeScript example uses standard Node HTTP primitives plus Prometheus-style metrics via `prom-client`.
 
 ```typescript
 /**
- * Layer 7 Reverse Proxy / Request Path Router
+ * Production-shaped L7 reverse proxy.
  *
- * Runtime: Node.js 18+
- * Dependencies: none
+ * Features:
+ * - Path-based routing
+ * - Least-inflight backend selection
+ * - Per-backend circuit breaker
+ * - Prometheus metrics
+ * - Active connection tracking
+ * - Graceful draining on shutdown
  *
- * This is a teaching-grade production template:
- * - Uses only standard HTTP libraries.
- * - Terminates the client HTTP connection at the proxy.
- * - Opens a separate upstream HTTP connection to the selected backend.
- * - Routes by URL path, which is only possible after reading the HTTP request.
- *
- * In real production, prefer hardened proxies such as Envoy, HAProxy, NGINX,
- * or a managed API gateway. Build your own only when you truly need custom behavior.
+ * Install:
+ *   npm install prom-client
  */
 
 import http, { IncomingMessage, ServerResponse } from "node:http";
 import { URL } from "node:url";
+import client from "prom-client";
 
 type Backend = {
   id: string;
   host: string;
   port: number;
-  healthy: boolean;
   inFlight: number;
+  failures: number;
+  circuitOpenUntil: number;
 };
 
 type RouteRule = {
@@ -415,71 +431,113 @@ type RouteRule = {
 
 const routes: RouteRule[] = [
   {
-    name: "payments",
-    pathPrefix: "/api/payments",
+    name: "orders",
+    pathPrefix: "/api/orders",
     backends: [
-      { id: "payments-a", host: "10.0.10.11", port: 8080, healthy: true, inFlight: 0 },
-      { id: "payments-b", host: "10.0.10.12", port: 8080, healthy: true, inFlight: 0 },
-    ],
-  },
-  {
-    name: "search",
-    pathPrefix: "/api/search",
-    backends: [
-      { id: "search-a", host: "10.0.20.11", port: 8080, healthy: true, inFlight: 0 },
-      { id: "search-b", host: "10.0.20.12", port: 8080, healthy: true, inFlight: 0 },
+      { id: "orders-a", host: "10.0.10.11", port: 8080, inFlight: 0, failures: 0, circuitOpenUntil: 0 },
+      { id: "orders-b", host: "10.0.10.12", port: 8080, inFlight: 0, failures: 0, circuitOpenUntil: 0 },
     ],
   },
   {
     name: "default",
     pathPrefix: "/",
     backends: [
-      { id: "app-a", host: "10.0.30.11", port: 8080, healthy: true, inFlight: 0 },
-      { id: "app-b", host: "10.0.30.12", port: 8080, healthy: true, inFlight: 0 },
+      { id: "app-a", host: "10.0.20.11", port: 8080, inFlight: 0, failures: 0, circuitOpenUntil: 0 },
+      { id: "app-b", host: "10.0.20.12", port: 8080, inFlight: 0, failures: 0, circuitOpenUntil: 0 },
     ],
   },
 ];
 
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+const requestCount = new client.Counter({
+  name: "proxy_requests_total",
+  help: "Total requests handled by the proxy",
+  labelNames: ["route", "status"],
+});
+
+const requestLatency = new client.Histogram({
+  name: "proxy_request_duration_seconds",
+  help: "Proxy request latency",
+  labelNames: ["route", "backend"],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+});
+
+const activeConnections = new client.Gauge({
+  name: "proxy_active_connections",
+  help: "Active client connections",
+});
+
+register.registerMetric(requestCount);
+register.registerMetric(requestLatency);
+register.registerMetric(activeConnections);
+
+let draining = false;
+
 function matchRoute(pathname: string): RouteRule {
-  // Longest prefix wins so /api/payments matches before /.
   return routes
     .filter((route) => pathname.startsWith(route.pathPrefix))
     .sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0];
 }
 
-function selectBackend(route: RouteRule): Backend | null {
-  const healthy = route.backends.filter((backend) => backend.healthy);
+function isCircuitOpen(backend: Backend): boolean {
+  return Date.now() < backend.circuitOpenUntil;
+}
 
-  if (healthy.length === 0) {
+function recordBackendFailure(backend: Backend): void {
+  backend.failures += 1;
+  if (backend.failures >= 5) {
+    backend.circuitOpenUntil = Date.now() + 30_000;
+  }
+}
+
+function recordBackendSuccess(backend: Backend): void {
+  backend.failures = 0;
+  backend.circuitOpenUntil = 0;
+}
+
+function selectBackend(route: RouteRule): Backend | null {
+  const candidates = route.backends.filter((backend) => !isCircuitOpen(backend));
+  if (candidates.length === 0) {
     return null;
   }
-
-  // Least-outstanding-request is simple and effective when request durations vary.
-  return healthy.reduce((best, current) =>
+  return candidates.reduce((best, current) =>
     current.inFlight < best.inFlight ? current : best
   );
 }
 
 function proxyRequest(clientReq: IncomingMessage, clientRes: ServerResponse): void {
+  if (draining) {
+    clientRes.writeHead(503, { "connection": "close" });
+    clientRes.end("server draining");
+    return;
+  }
+
+  if (clientReq.url === "/metrics") {
+    register.metrics().then((body) => {
+      clientRes.writeHead(200, { "content-type": register.contentType });
+      clientRes.end(body);
+    });
+    return;
+  }
+
+  activeConnections.inc();
+  clientRes.on("finish", () => activeConnections.dec());
+
   const requestUrl = new URL(clientReq.url ?? "/", `http://${clientReq.headers.host}`);
   const route = matchRoute(requestUrl.pathname);
   const backend = selectBackend(route);
 
   if (!backend) {
+    requestCount.inc({ route: route.name, status: "503" });
     clientRes.writeHead(503, { "content-type": "application/json" });
-    clientRes.end(JSON.stringify({ error: "No healthy upstreams", route: route.name }));
+    clientRes.end(JSON.stringify({ error: "no healthy upstreams" }));
     return;
   }
 
+  const endTimer = requestLatency.startTimer({ route: route.name, backend: backend.id });
   backend.inFlight += 1;
-
-  // Forward standard proxy headers so the backend can recover client context.
-  const forwardedFor = [
-    clientReq.headers["x-forwarded-for"],
-    clientReq.socket.remoteAddress,
-  ]
-    .filter(Boolean)
-    .join(", ");
 
   const upstreamReq = http.request(
     {
@@ -491,23 +549,22 @@ function proxyRequest(clientReq: IncomingMessage, clientRes: ServerResponse): vo
       headers: {
         ...clientReq.headers,
         host: `${backend.host}:${backend.port}`,
-        "x-forwarded-for": forwardedFor,
+        "x-forwarded-for": [clientReq.headers["x-forwarded-for"], clientReq.socket.remoteAddress]
+          .filter(Boolean)
+          .join(", "),
         "x-forwarded-proto": "http",
-        "x-forwarded-host": clientReq.headers.host ?? "",
         "x-route-name": route.name,
-        "x-upstream-backend": backend.id,
       },
     },
     (upstreamRes) => {
-      clientRes.writeHead(upstreamRes.statusCode ?? 502, {
-        ...upstreamRes.headers,
-        "x-route-name": route.name,
-        "x-upstream-backend": backend.id,
-      });
+      recordBackendSuccess(backend);
+      requestCount.inc({ route: route.name, status: String(upstreamRes.statusCode ?? 502) });
 
+      clientRes.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
       upstreamRes.pipe(clientRes);
       upstreamRes.on("end", () => {
         backend.inFlight -= 1;
+        endTimer();
       });
     }
   );
@@ -516,220 +573,143 @@ function proxyRequest(clientReq: IncomingMessage, clientRes: ServerResponse): vo
     upstreamReq.destroy(new Error("upstream timeout"));
   });
 
-  upstreamReq.on("error", (error) => {
+  upstreamReq.on("error", () => {
     backend.inFlight = Math.max(0, backend.inFlight - 1);
+    recordBackendFailure(backend);
+    endTimer();
+    requestCount.inc({ route: route.name, status: "502" });
 
-    // Marking unhealthy on a single error is aggressive. Real systems usually
-    // require several failed health checks before ejecting an upstream.
-    backend.healthy = false;
-
-    clientRes.writeHead(502, { "content-type": "application/json" });
-    clientRes.end(
-      JSON.stringify({
-        error: "Bad gateway",
-        route: route.name,
-        backend: backend.id,
-        detail: error.message,
-      })
-    );
+    if (!clientRes.headersSent) {
+      clientRes.writeHead(502, { "content-type": "application/json" });
+    }
+    clientRes.end(JSON.stringify({ error: "bad gateway" }));
   });
 
-  // Stream the client body to the selected backend without buffering the full body in memory.
   clientReq.pipe(upstreamReq);
-}
-
-function startHealthChecks(): void {
-  setInterval(() => {
-    for (const route of routes) {
-      for (const backend of route.backends) {
-        const req = http.request(
-          {
-            host: backend.host,
-            port: backend.port,
-            path: "/healthz",
-            method: "GET",
-            timeout: 1_000,
-          },
-          (res) => {
-            backend.healthy = (res.statusCode ?? 500) < 500;
-            res.resume();
-          }
-        );
-
-        req.on("timeout", () => req.destroy(new Error("health check timeout")));
-        req.on("error", () => {
-          backend.healthy = false;
-        });
-        req.end();
-      }
-    }
-  }, 5_000);
 }
 
 const server = http.createServer(proxyRequest);
 
+server.keepAliveTimeout = 5_000;
 server.headersTimeout = 10_000;
 server.requestTimeout = 30_000;
-server.keepAliveTimeout = 5_000;
-
-startHealthChecks();
 
 server.listen(8080, () => {
-  console.log("L7 reverse proxy listening on http://0.0.0.0:8080");
+  console.log("proxy listening on http://0.0.0.0:8080");
 });
 
-function shutdown(signal: string): void {
-  console.log(`Received ${signal}. Draining connections...`);
+function drain(signal: string): void {
+  console.log(`received ${signal}; starting graceful drain`);
+  draining = true;
+
   server.close(() => {
-    console.log("Proxy stopped.");
+    console.log("all active connections drained");
     process.exit(0);
   });
+
+  setTimeout(() => {
+    console.error("drain timeout exceeded; forcing exit");
+    process.exit(1);
+  }, 30_000).unref();
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", drain);
+process.on("SIGTERM", drain);
 ```
-
-### What This Code Demonstrates
-
-| Concept | Where It Appears |
-|---|---|
-| **TCP termination** | The proxy receives the client request and creates a new upstream request |
-| **L7 routing** | `matchRoute()` routes by URL path |
-| **Load balancing** | `selectBackend()` chooses the backend with the fewest active requests |
-| **Backend isolation** | Clients never connect directly to `10.0.x.x` services |
-| **Operational controls** | Timeouts, health checks, shutdown handling, and forwarding headers |
 
 ---
 
-## 10. Design Interview Signals
+## 9. Active-Passive Failover And Split-Brain
 
-Strong candidates do not just name components. They explain trade-offs.
+In active-passive failover, one load balancer owns a virtual IP while another waits. Heartbeats determine whether the passive node should promote itself.
 
-| Weak Answer | Strong Answer |
-|---|---|
-| "Use a load balancer." | "Use L4 if all backends are equivalent and throughput matters most; use L7 if I need host/path/header/cookie-aware routing." |
-| "Put a CDN in front." | "Use long TTLs for immutable assets, short TTLs or purge workflows for changing pages, and request coalescing to avoid origin stampedes." |
-| "Use active-passive failover." | "Use heartbeats, VIP takeover, redundant heartbeat paths, and fencing to prevent split-brain." |
-| "Terminate SSL at the proxy." | "Centralize certificate management, offload crypto, add forwarding headers carefully, and decide whether backend traffic must be re-encrypted." |
+```mermaid
+sequenceDiagram
+    participant A as Active LB
+    participant P as Passive LB
+    participant N as Network / VIP
+
+    A->>P: heartbeat
+    A->>P: heartbeat
+    Note over A,P: Heartbeat network fails, but Active is still serving
+    P--xA: heartbeat missed
+    P--xA: heartbeat missed
+    P->>P: assume active is dead
+    P->>N: claim VIP
+    A->>N: still owns VIP
+    Note over A,P: Split-brain: both believe they are active
+```
+
+Mitigations:
+
+- Redundant heartbeat links.
+- Quorum or witness node.
+- Fencing to ensure the old primary is stopped.
+- Conservative failover thresholds.
+- Independent health checks from more than one network path.
+
+---
+
+## 10. Interview Scenarios
+
+> **Scenario 1: Your CDN origin is overwhelmed every 60 seconds. Why?**  
+> Likely synchronized TTL expiry. Many edge nodes revalidate at the same time. Add TTL jitter, request coalescing, origin shield, stale-while-revalidate, and cache warming for hot objects.
+
+> **Scenario 2: Active-passive LB split-brain just occurred. What do you do?**  
+> Fence one node immediately, stabilize VIP ownership, inspect heartbeat network failure, add quorum/witness protection, and review failover thresholds. Prioritize single-writer ownership over fast promotion.
+
+> **Scenario 3: L7 proxy CPU is saturated but L4 metrics look fine. What changes?**  
+> Check TLS handshakes, disabled session resumption, header/body buffering, compression, WAF rules, logging volume, and upstream connection reuse. Consider moving simple TCP traffic to L4 or terminating TLS closer to clients.
+
+> **Scenario 4: Users behind one enterprise NAT are rate limited. What changes?**  
+> Do not rely only on source IP. Add authenticated user, tenant, API key, or session-aware limit dimensions. Keep IP limits for unauthenticated abuse.
 
 ---
 
 ## Self-Assessment Questions
 
 > **Question 1: TCP Connection Termination in Layer 7 Load Balancing**  
-> If you deploy a Layer 7 load balancer to route traffic based on user cookies, describe the exact mechanism that happens to the TCP connection between the client and the backend server compared to a Layer 4 load balancer. What specific advantage does this provide for handling sticky sessions?
+> If you deploy a Layer 7 load balancer to route traffic based on user cookies, describe the exact mechanism that happens to the TCP connection between the client and the backend server compared to a Layer 4 load balancer. What specific advantage does this provide for sticky sessions?
 
 > **Question 2: Push vs. Pull CDN for News Websites**  
-> You are designing a high-traffic news website where articles are updated sporadically throughout the day, but images are rarely changed. Would you choose a Push CDN or a Pull CDN for this architecture, and how would you configure the TTL for each asset type to balance server load against content staleness? Explain your trade-offs.
+> You are designing a high-traffic news website where articles are updated throughout the day, but images are rarely changed. Would you choose Push CDN or Pull CDN, and how would you configure TTLs for each asset type?
 
 > **Question 3: Active-Passive Load Balancer Failover**  
-> If you are using an Active-Passive load balancer failover architecture, explain the exact mechanism that triggers the failover from primary to secondary. What is the specific risk regarding downtime during a cold standby versus a hot standby?
+> Explain the exact mechanism that triggers failover from primary to secondary. What is the downtime risk of cold standby versus hot standby?
+
+> **Question 4: L4 vs. L7 Product Choice**  
+> When would you choose an L4 global accelerator style design over an L7 API gateway style design?
+
 <details><summary>Click for FAANG-Level Verification Rubric</summary>
 
-## Question 1: TCP Connection Termination In Layer 7 Load Balancing
+## Question 1
 
-A FAANG-level answer must clearly separate **Layer 4 NAT** from **Layer 7 termination**.
+An L4 load balancer forwards packets using transport metadata and usually NAT. It does not inspect HTTP cookies. An L7 load balancer terminates the client-side TCP/TLS connection, parses HTTP, reads the cookie, makes a routing decision, and opens a separate backend connection.
 
-### Correct Mechanism
+The sticky-session advantage is that L7 can use a real application identity such as `session_id`, tenant ID, or auth claims rather than coarse source-IP hashing.
 
-In a **Layer 4 load balancer**, the balancer does not inspect the HTTP request. It forwards packets using transport metadata such as source IP, destination IP, source port, destination port, and protocol. It may rewrite packet headers using NAT, but the payload stays opaque. The balancer does not need to parse cookies because it cannot see application-layer data.
+## Question 2
 
-In a **Layer 7 load balancer**, the balancer terminates the client-side TCP connection. If TLS is used, it also terminates TLS, decrypts the request, and reads HTTP fields such as headers, path, method, and cookies. It then opens a separate backend TCP connection to the selected upstream server.
+Use a hybrid CDN strategy. Article HTML should usually use pull CDN with short TTLs, purge support, and stale-while-revalidate. Images should use long TTLs, content-hashed URLs, and either push or pull distribution. Add origin shield and request coalescing for viral pages.
 
-The important detail: **L7 creates two connections**.
+## Question 3
 
-| Segment | Description |
-|---|---|
-| Client to load balancer | The browser believes it is talking to the service endpoint |
-| Load balancer to backend | The load balancer becomes the client from the backend's perspective |
+Failover is triggered by missed heartbeats or failed health checks. A passive node promotes itself and claims the VIP through ARP/control-plane update. Cold standby increases downtime because processes, certificates, caches, and backend pools may need to warm. Hot standby reduces failover time but costs more.
 
-### Impact On Latency
+Split-brain risk must be mitigated with quorum, fencing, redundant heartbeats, and independent health checks.
 
-TCP termination adds work at the edge. The balancer must manage connection state, parse HTTP, potentially decrypt TLS, apply routing rules, and forward the request on a new upstream connection. That can add latency compared with L4 NAT.
+## Question 4
 
-The exact impact depends on implementation, connection reuse, TLS settings, hardware acceleration, and whether upstream connections are already warm. In optimized modern systems, the added overhead can be small, but it is still a real trade-off: **more routing intelligence for more edge processing**.
-
-### Sticky Session Advantage
-
-Layer 4 stickiness is usually based on source IP hashing. That is coarse and can be unfair when many users sit behind the same NAT gateway, corporate proxy, or mobile carrier.
-
-Layer 7 can read cookies. It can route by `session_id`, `user_id`, or another stable application identifier. That allows all requests for the same user session to reach the same backend without overloading one backend just because many users share an IP address.
-
-An excellent answer also mentions that L7 proxies commonly preserve original client context using headers such as `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`.
-
-## Question 2: Push vs. Pull CDN For A News Website
-
-A strong answer should avoid choosing a single CDN mode for everything. The best design is usually **hybrid**.
-
-### Recommended Architecture
-
-Use a **Pull CDN** for article HTML because articles are requested unpredictably and updated throughout the day. The CDN should fetch from the origin on cache miss, then cache for a short TTL.
-
-Use **aggressive caching** for images because they rarely change. This can be a Push CDN workflow or a Pull CDN with immutable, content-hashed URLs and long TTLs.
-
-### TTL Strategy
-
-| Asset | Recommended TTL | Reason |
-|---|---:|---|
-| Breaking news HTML | 15 to 60 seconds | High freshness requirement |
-| Normal article HTML | 60 to 300 seconds | Balance freshness and origin protection |
-| Images | Hours to days | Rarely change and expensive to repeatedly serve from origin |
-| CSS/JS with hashed filenames | Months to 1 year | Safe because new content gets a new filename |
-
-### Trade-Offs
-
-Short TTLs reduce staleness but increase origin load. Long TTLs reduce load and latency but risk serving stale content.
-
-For a high-traffic news site, the danger is not only cache misses. The danger is synchronized cache expiry. If a viral article expires everywhere at once, the origin may receive a flood of identical revalidation requests.
-
-### Thundering Herd Mitigation
-
-A comprehensive answer should include:
-
-| Technique | Explanation |
-|---|---|
-| Request coalescing | Let only one request refresh an expired object while others wait |
-| Stale-while-revalidate | Serve stale content briefly while refreshing in the background |
-| Origin shielding | Route CDN misses through shield caches before origin |
-| Soft TTLs | Refresh before hard expiry to avoid synchronized misses |
-| Cache warming | Preload predictable high-demand content |
-| Content-hashed assets | Avoid purging unchanged images, CSS, and JavaScript |
-
-The best answer connects TTL settings directly to business needs: news freshness, image stability, origin capacity, and user latency.
-
-## Question 3: Active-Passive Load Balancer Failover
-
-A correct answer must describe **heartbeat detection**, **failover promotion**, and **downtime risk**.
-
-### Exact Failover Mechanism
-
-In active-passive failover, the active load balancer owns the virtual IP and serves production traffic. The passive load balancer monitors the active node using heartbeat messages.
-
-Failover occurs when the passive node misses enough heartbeats to conclude that the active node is unavailable. It then promotes itself and takes over the virtual IP. In many environments, this takeover is announced using gratuitous ARP or an equivalent control-plane update so the network begins sending traffic to the new active node.
-
-### Cold Standby Risk
-
-A **cold standby** is not fully ready to serve. It may need to start processes, load configuration, initialize certificates, warm connection pools, rebuild caches, or attach the virtual IP. During that time, users may see connection failures, timeouts, or elevated latency.
-
-The risk is **longer downtime and worse first-request latency** during transition.
-
-### Hot Standby Advantage
-
-A **hot standby** is already running, configured, and often partially synchronized. It can take over faster because the process is alive, certificates are loaded, health checks are active, and backend connections may already be warm.
-
-### Split-Brain Risk
-
-The most dangerous failure mode is split-brain. If the heartbeat path fails but the active load balancer is still alive, the passive node may promote itself incorrectly. Both nodes may believe they are active.
-
-Mitigations include redundant heartbeat networks, quorum, fencing, independent health checks, and careful failover thresholds.
-
-### Rubric
-
-| Level | Expected Answer |
-|---|---|
-| Beginner | Knows that passive takes over when active fails |
-| Intermediate | Explains heartbeat monitoring and cold vs. hot standby |
-| FAANG-level | Explains heartbeat thresholds, VIP takeover, downtime sources, split-brain risk, and mitigations |
+Choose L4 when you need global static anycast entry, TCP/UDP forwarding, very high throughput, and do not need request-aware routing. Choose L7 when you need API policy, auth, path/host routing, request validation, transformation, WAF behavior, or per-route observability.
 
 </details>
+
+---
+
+## References
+
+- [AWS Global Accelerator: How it works](https://docs.aws.amazon.com/global-accelerator/latest/dg/introduction-how-it-works.html)
+- [Amazon API Gateway documentation](https://docs.aws.amazon.com/apigateway/)
+- [Amazon CloudFront expiration and stale directives](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html)
+- [Amazon CloudFront Origin Shield](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/origin-shield.html)
+- [Cloudflare CDN reference architecture](https://cf-assets.www.cloudflare.com/slt3lc6tev37/18dA4NLfq8oXY8EVZxPlpY/b9cab82be79ebefa80f08c09eaa3d93e/Cloudflare_CDN_Reference_Architecture.pdf)
