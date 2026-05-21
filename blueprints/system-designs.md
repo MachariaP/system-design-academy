@@ -1,8 +1,22 @@
-# Real-World System Design Blueprints
+# Real-World System Design Playbook
 
-This guide turns the repository's core modules into whiteboard-ready architecture playbooks.
+This playbook turns the academy modules into interview-ready architecture guides.
 
-The goal is not to memorize diagrams. The goal is to show senior engineering judgment: bound the system mathematically, choose the right storage and communication patterns, identify failure modes early, and explain how the system behaves under stress.
+Each blueprint is structured for senior system design loops: **bound the problem**, **draw the architecture**, **deep-dive the core components**, and **resolve bottlenecks with explicit trade-offs**.
+
+> 🧠 **Staff-engineer note**  
+> Strong candidates do not just choose technologies. They explain the failure mode that forced the choice.
+
+---
+
+## Master Comparison
+
+| Blueprint | Read/Write Ratio | Consistency Needs | Primary Scaling Bottleneck | Storage Type | Cache Strategy | Async Patterns |
+|---|---:|---|---|---|---|---|
+| **URL Shortener** | ~10:1 reads to writes | Strong consistency for code creation; eventual analytics | Viral redirects and hot keys | SQL/KV metadata + object storage for large content | Redis/Memcached for code lookup, negative caching, leases, gutter pool | Click analytics, expiration cleanup |
+| **Web Crawler** | Search reads dominate; crawl writes are continuous | Eventual consistency for index freshness; strict politeness constraints | Bandwidth, deduplication, index writes | Distributed blob/chunk storage + inverted index + frontier store | DNS cache, robots cache, query cache, Bloom filters | Crawl frontier, parse/index pipelines |
+| **Twitter Timeline** | Extremely read-heavy | Durable tweet writes; eventual timeline/counter consistency | Fan-out explosion and celebrity accounts | Tweet store + graph store + Redis timeline buckets + search index | Redis timeline refs, multiget object cache, gutter pool, leases | Kafka fan-out, indexing, notification jobs |
+| **Live Comments System** | Read/broadcast-heavy during live events | Per-stream ordering; idempotent delivery; eventual moderation views | Hot live rooms and WebSocket fanout | Sharded message log + ephemeral buffers + moderation store | Per-room hot buffers, edge connection state, recent message cache | Pub/sub fanout, moderation queues, replay buffers |
 
 ---
 
@@ -12,93 +26,136 @@ The goal is not to memorize diagrams. The goal is to show senior engineering jud
 
 **Functional requirements**
 
-- Create a short URL for a long URL or paste-like text object.
-- Redirect users from a short code to the original URL or stored content.
+- Create a short URL for a long URL or paste-like object.
+- Redirect users from short code to destination.
 - Support optional custom aliases and expiration.
 - Track click analytics asynchronously.
-- Delete or expire old links.
+- Delete or deactivate links.
 
 **Non-functional requirements**
 
-- Redirects must be extremely low latency.
-- Reads are much higher than writes.
-- System should prefer availability for redirects.
-- Link creation should avoid collisions.
+- Redirect path must be extremely fast and highly available.
+- Short-code creation must avoid collisions.
 - Analytics can be eventually consistent.
+- Expired or abusive links must be blocked quickly.
 
 **Assumptions**
 
 | Input | Value |
 |---|---:|
-| New URLs / pastes | 10 million / month |
-| Reads / redirects | 100 million / month |
-| Read-to-write ratio | 10:1 |
-| Average stored object | 1 KB content + 300 B metadata = 1.3 KB |
-| Retention window | 5 years |
-| Short code length | 7 Base62 characters |
+| New links | 10 million / month |
+| Redirect reads | 100 million / month |
+| Read/write ratio | 10:1 |
+| Average object | 1 KB content + 300 B metadata |
+| Retention | 5 years |
+| Short code | 7 Base62 characters |
 
-**Storage estimate**
+**Storage**
 
 | Item | Calculation | Result |
 |---|---:|---:|
-| Monthly writes | 10,000,000 objects | 10 million |
-| Monthly raw storage | 10,000,000 x 1.3 KB | 13 GB / month |
-| 5-year raw storage | 13 GB x 60 months | 780 GB |
+| Monthly writes | 10,000,000 links | 10 million |
+| Monthly raw storage | 10,000,000 x 1.3 KB | 13 GB |
+| 5-year raw storage | 13 GB x 60 | 780 GB |
 | Replication factor 3 | 780 GB x 3 | 2.34 TB |
-| Index and overhead estimate | ~30% | ~3.0 TB total |
+| Index/metadata overhead | +30% | ~3 TB |
 
-**QPS estimate**
+**QPS**
 
-| Traffic Type | Calculation | Average QPS |
-|---|---:|---:|
-| Writes | 10,000,000 / 30 days / 86,400 sec | ~4 QPS |
-| Reads | 100,000,000 / 30 days / 86,400 sec | ~39 QPS |
-| Peak multiplier | 20x average | ~80 write QPS, ~780 read QPS |
+| Traffic | Calculation | Average | 20x Peak |
+|---|---:|---:|---:|
+| Writes | 10M / 30 / 86,400 | ~4 QPS | ~80 QPS |
+| Reads | 100M / 30 / 86,400 | ~39 QPS | ~780 QPS |
+| Analytics events | Same as reads | ~39 QPS | ~780 QPS |
 
-**Bandwidth estimate**
+**Bandwidth**
 
 | Path | Calculation | Average |
 |---|---:|---:|
 | Write ingress | 4 QPS x 1.3 KB | ~5.2 KB/s |
-| Read egress | 39 QPS x 1.3 KB | ~51 KB/s |
-| Peak read egress | 780 QPS x 1.3 KB | ~1 MB/s |
+| Redirect metadata read | 39 QPS x ~500 B | ~19.5 KB/s |
+| Paste/content read | 39 QPS x 1.3 KB | ~51 KB/s |
+| Peak content read | 780 QPS x 1.3 KB | ~1 MB/s |
 
-These averages are modest. The design challenge is not average traffic. It is **viral hot links**, cache stampedes, global latency, and maintaining redirect availability.
+> 📐 **Math check**  
+> If read traffic is 1 billion/month instead of 100 million/month, average reads become ~386 QPS and 20x peak becomes ~7,720 QPS. The architecture still works, but cache hit ratio becomes the central SLO.
 
 #### 2. High-Level Architecture (A clear textual map of component placement)
 
-**Create path**
+**Component map**
 
-1. Client sends `POST /v1/links` to the nearest edge.
-2. DNS uses latency or geolocation routing.
-3. CDN is mostly bypassed for writes.
-4. L7 load balancer terminates TLS and routes to Link Write API.
-5. Write API validates input and generates a short code.
-6. Metadata is written to the primary database.
-7. Large paste content, if supported, is stored in object storage.
-8. Analytics event is published to Kafka or RabbitMQ.
-9. API returns the short URL.
+```mermaid
+flowchart LR
+    Client["Client / Browser"]
 
-**Redirect path**
+    subgraph Control["Control Plane"]
+        DNS["Geo/Latency DNS"]
+        Edge["Edge Proxy + TLS"]
+        WriteAPI["Link Write API"]
+        IDGen["ID Generator<br/>Base62 code"]
+        AnalyticsQ["Analytics Queue"]
+        ExpiryWorker["Expiry Worker"]
+    end
 
-1. Client requests `GET /{short_code}`.
-2. Edge proxy routes to Redirect API.
-3. Redirect API checks Redis/Memcached for `short_code -> destination`.
-4. On hit, return `301` or `302`.
-5. On miss, read from database, populate cache with TTL, then redirect.
-6. Emit click event asynchronously.
+    subgraph Data["Data Plane"]
+        RedirectAPI["Redirect API"]
+        Cache["Redis/Memcached<br/>code -> destination"]
+        DB["Primary Metadata Store<br/>SQL or strongly consistent KV"]
+        Replicas["Read Replicas"]
+        ObjectStore["Object Storage<br/>optional paste content"]
+        Gutter["Gutter Cache Pool"]
+    end
 
-**Component placement**
+    Client --> DNS --> Edge
+    Edge -->|"POST /v1/links"| WriteAPI
+    WriteAPI --> IDGen
+    WriteAPI --> DB
+    WriteAPI --> ObjectStore
+    WriteAPI --> AnalyticsQ
+    ExpiryWorker --> DB
 
-| Layer | Component | Role |
-|---|---|---|
-| Edge | DNS, CDN, L7 load balancer | Global routing, TLS termination, request filtering |
-| API | Link Write API, Redirect API | Separate write and read scaling |
-| Cache | Redis/Memcached | Hot short-code lookup |
-| Storage | SQL or strongly consistent KV store | Source of truth for code mapping |
-| Object storage | S3/GCS-like blob store | Optional paste content |
-| Async | Kafka/RabbitMQ | Click analytics and expiration workflows |
-| Analytics | Stream processors + warehouse | Click counts, dashboards, abuse detection |
+    Edge -->|"GET /{code}"| RedirectAPI
+    RedirectAPI --> Cache
+    Cache -->|"miss"| Replicas
+    Replicas --> DB
+    RedirectAPI --> ObjectStore
+    RedirectAPI --> AnalyticsQ
+    Cache -. failure .-> Gutter
+
+    style Control fill:#e8f4ff,stroke:#2563eb
+    style Data fill:#ecfdf5,stroke:#059669
+```
+
+**Critical path: redirect flow**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant E as Edge/L7 LB
+    participant R as Redirect API
+    participant M as Memcached/Redis
+    participant G as Gutter Pool
+    participant D as Metadata DB
+    participant Q as Analytics Queue
+
+    C->>E: GET /aB91kLm
+    E->>R: Route redirect request
+    R->>M: get(code)
+    alt Cache hit
+        M-->>R: destination_url
+        R-->>C: 302 Location: destination_url
+    else Cache miss
+        R->>D: SELECT destination_url WHERE code=?
+        D-->>R: destination_url
+        R->>M: set(code, destination_url, ttl+jitter)
+        R-->>C: 302 Location: destination_url
+    else Primary cache node failed
+        R->>G: get/set temporary hot key
+        G-->>R: cached or temporary value
+        R-->>C: 302 or controlled fallback
+    end
+    R->>Q: emit ClickRecorded event
+```
 
 #### 3. Core Component Deep-Dive (Schema definitions, API endpoint definitions, and algorithmic mechanics)
 
@@ -106,23 +163,26 @@ These averages are modest. The design challenge is not average traffic. It is **
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/v1/links` | `POST` | Create short link |
-| `/v1/links/{code}` | `GET` | Fetch metadata for owner/admin |
+| `/v1/links` | `POST` | Create a short link |
+| `/v1/links/{code}` | `GET` | Get owner/admin metadata |
 | `/{code}` | `GET` | Redirect user |
-| `/v1/links/{code}` | `DELETE` | Delete or deactivate link |
+| `/v1/links/{code}` | `DELETE` | Deactivate link |
 | `/v1/links/{code}/analytics` | `GET` | Read aggregated analytics |
 
-**Create request**
+**Idempotent create request**
 
 ```json
 {
+  "idempotency_key": "user-123:create-link:01J5X9Q9",
   "destination_url": "https://example.com/a/very/long/path",
-  "custom_alias": "optionalAlias",
+  "custom_alias": null,
   "expires_at": "2027-01-01T00:00:00Z"
 }
 ```
 
-**Core schema**
+The server stores the `idempotency_key` with the response. If the client retries after a timeout, the API returns the same short code rather than creating duplicates.
+
+**Schema**
 
 ```sql
 CREATE TABLE short_links (
@@ -130,91 +190,70 @@ CREATE TABLE short_links (
     destination_url TEXT NOT NULL,
     content_object_path TEXT NULL,
     owner_user_id BIGINT NULL,
+    idempotency_key VARCHAR(128) NULL UNIQUE,
     created_at TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- Speeds up owner dashboards ordered by newest links.
 CREATE INDEX idx_short_links_owner_created
-ON short_links (owner_user_id, created_at);
+ON short_links (owner_user_id, created_at DESC);
 
+-- Allows expiration workers to scan only links that are due for cleanup.
 CREATE INDEX idx_short_links_expires_at
 ON short_links (expires_at);
-```
 
-**Analytics event schema**
-
-```json
-{
-  "event_id": "uuid",
-  "code": "aB91kLm",
-  "timestamp": "2026-05-21T10:00:00Z",
-  "ip_hash": "privacy-preserving-hash",
-  "user_agent": "browser-agent",
-  "referer": "https://source.example"
-}
+-- Supports retry-safe creation for clients that repeat POST /v1/links.
+CREATE UNIQUE INDEX idx_short_links_idempotency
+ON short_links (idempotency_key);
 ```
 
 **Short-code generation**
 
-Base62 alphabet:
-
-```text
-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
-```
-
-A 7-character Base62 code provides:
-
-```text
-62^7 = 3,521,614,606,208 possible codes
-```
-
-That is far above the 5-year requirement of:
-
-```text
-10 million/month x 60 months = 600 million codes
-```
-
-**Generation options**
-
-| Strategy | Strength | Risk |
+| Strategy | Why Use It | Risk |
 |---|---|---|
-| Auto-increment ID -> Base62 | No collisions, compact | Predictable unless obfuscated |
-| Random 7-char Base62 | Simple, hard to enumerate | Collision handling required |
-| Hash URL + salt -> Base62 | Deterministic option | Collisions and duplicate semantics need care |
-| Dedicated ID service | High scale and no collisions | New infrastructure dependency |
+| ID generator -> Base62 | No collisions and compact codes | Predictable unless salted or shuffled |
+| Random Base62 | Hard to enumerate | Must retry on collision |
+| Hash URL + salt | Deterministic option | Collision and duplicate semantics need care |
 
-Recommended interview answer: use a dedicated ID generator or monotonic ID range allocator, then Base62 encode the ID. For custom aliases, enforce uniqueness with the primary key.
+Recommended design: allocate IDs from a dedicated ID service, encode with Base62, and reserve custom aliases through a unique constraint.
 
 #### 4. Scaling & Bottleneck Resolutions (Applying lessons from GFS, Dynamo, and Memcached)
 
-**Hot links**
+**What if...? Viral link + cache node failure**
 
-Viral links create hot keys. Use Redis/Memcached in front of the database and apply cache-stampede controls.
+> ⚠️ **Failure mode**  
+> A viral code is served mostly from one cache node. That node fails. Clients rehash to the remaining cache fleet or fall through to the database. The database sees a sudden hot-key storm and redirect latency spikes.
 
-| Problem | Resolution |
+**Walkthrough**
+
+1. Viral code `xYz1234` reaches hundreds of thousands of QPS.
+2. Its cache owner node fails.
+3. Redirect API starts missing.
+4. Without protection, every miss queries the metadata DB.
+5. DB connection pool saturates.
+6. Redirects fail globally even though the mapping is small and stable.
+
+**Mitigation**
+
+| Step | Action |
 |---|---|
-| Many cache misses for same viral code | Facebook-style leases or request coalescing |
-| Cache node failure sends traffic to DB | Gutter pool or emergency cache tier |
-| TTL avalanche | Randomized TTL jitter |
-| Nonexistent code attack | Negative caching and Bloom filter |
+| 1 | Route failed-node keys to a small **gutter pool** instead of rehashing broadly |
+| 2 | Use request coalescing or Facebook-style leases so one request refills the key |
+| 3 | Serve stale cached redirects briefly when safe |
+| 4 | Add negative caching for nonexistent codes |
+| 5 | Replicate viral keys across multiple cache nodes |
 
-**Database scaling**
+**Decision log**
 
-| Pressure | Resolution |
-|---|---|
-| Read pressure | Cache + read replicas |
-| Write pressure | Shard by code prefix or hash(code) |
-| Expiration scans | Index on `expires_at` and async cleanup workers |
-| Analytics writes | Kafka stream, not synchronous DB writes |
-
-**Dynamo lesson**
-
-Redirects are availability-sensitive. For cached redirect mappings, the system can tolerate brief staleness better than outage. Use eventually consistent replicas for global reads, but route owner/admin writes through a primary path.
-
-**GFS lesson**
-
-If paste content or preview blobs grow large, keep metadata separate from blob data. Store link metadata in a database and large content in object storage, so the database does not become the data plane for bulky reads.
+| Decision | Choice | Rationale |
+|---|---|---|
+| Metadata store | SQL or strongly consistent KV | Code uniqueness and idempotent creation need strong constraints |
+| Redirect cache | Redis/Memcached | Redirect path is read-heavy and latency-sensitive |
+| Analytics | Async queue | Click tracking must not slow redirect |
+| Blob content | Object storage | Keeps large data out of metadata DB |
+| Hot-key mitigation | Leases + gutter pool | Prevents cache failure from becoming DB failure |
 
 ---
 
@@ -225,107 +264,153 @@ If paste content or preview blobs grow large, keep metadata separate from blob d
 **Functional requirements**
 
 - Crawl discovered URLs.
-- Respect robots.txt, politeness rules, and per-host rate limits.
-- Deduplicate pages and avoid infinite crawl loops.
+- Respect robots.txt and per-host politeness.
+- Deduplicate pages and avoid graph cycles.
 - Extract links, titles, snippets, and content signatures.
-- Build a reverse index from terms to documents.
+- Build reverse index from terms to documents.
 - Serve search queries with ranked results.
 
 **Non-functional requirements**
 
-- Massive horizontal scalability.
-- High throughput ingestion.
-- Freshness should be tunable by domain importance.
-- Search query latency must be low.
-- Crawling must not overload external websites.
+- Horizontal crawl scalability.
+- Low-latency search serving.
+- Tunable freshness by domain importance.
+- Strict protection against over-crawling external sites.
 
 **Assumptions**
 
 | Input | Value |
 |---|---:|
-| Unique URLs tracked | 1 billion |
-| Recrawl frequency | Weekly average |
-| URLs crawled / month | ~4 billion |
-| Average fetched page | 500 KB |
-| Search QPS | 40,000 QPS |
-| Crawl write throughput | 1,600 pages/sec |
-| Retention window | 3 years raw/archive |
+| URLs tracked | 1 billion |
+| Recrawl frequency | Weekly |
+| Crawls / month | ~4 billion |
+| Average page | 500 KB |
+| Crawl throughput | 1,600 pages/sec |
+| Search traffic | 40,000 QPS |
+| Raw retention | 3 years |
 
-**Storage estimate**
+**Storage**
 
 | Item | Calculation | Result |
 |---|---:|---:|
-| Monthly raw crawl | 4B pages x 500 KB | 2 PB / month |
+| Monthly raw crawl | 4B x 500 KB | 2 PB/month |
 | 3-year raw crawl | 2 PB x 36 | 72 PB |
 | Replication factor 3 | 72 PB x 3 | 216 PB |
-| Index storage estimate | 10-30% of raw | 7.2-21.6 PB |
+| Index storage estimate | 10-30% raw | 7.2-21.6 PB |
 
-In practice, systems compress, summarize, tier, and expire aggressively. The raw number proves this is a distributed storage problem, not a single database problem.
+**QPS**
 
-**QPS estimate**
-
-| Traffic Type | Estimate |
+| Traffic | Estimate |
 |---|---:|
-| Crawl fetches | 1,600 pages/sec |
-| Link extraction writes | Tens of thousands/sec depending page fanout |
-| Index writes | 1,600 documents/sec plus term postings |
+| Crawl fetches | 1,600/sec |
+| Link extraction writes | Tens of thousands/sec |
+| Document index writes | 1,600 docs/sec plus term postings |
 | Search reads | 40,000 QPS |
-| Peak query multiplier | 5-10x by event/news cycle |
+| Peak query multiplier | 5-10x during events |
 
-**Bandwidth estimate**
+**Bandwidth**
 
 | Path | Calculation | Result |
 |---|---:|---:|
 | Crawl ingress | 1,600 x 500 KB/sec | 800 MB/sec |
-| Crawl ingress daily | 800 MB/sec x 86,400 | ~69 TB/day |
-| Search response egress | 40,000 x 20 KB | ~800 MB/sec |
+| Daily crawl ingress | 800 MB/sec x 86,400 | ~69 TB/day |
+| Search egress | 40,000 x 20 KB | ~800 MB/sec |
+
+> 📐 **Math check**  
+> If the average page is compressed to 100 KB before long-term storage, 3-year raw storage drops from 72 PB to ~14.4 PB before replication. Compression and tiering are not optimizations here; they are architectural requirements.
 
 #### 2. High-Level Architecture (A clear textual map of component placement)
 
-**Crawler control path**
+```mermaid
+flowchart LR
+    Seeds["Seed URLs"]
 
-1. Seed URLs enter the frontier.
-2. URL Frontier prioritizes URLs by freshness, popularity, domain budget, and politeness.
-3. Scheduler assigns URLs to crawler workers.
-4. Crawler workers use DNS cache and connection pools.
-5. Fetcher downloads pages.
-6. Parser extracts links, text, title, canonical URL, and content fingerprint.
-7. Dedup service checks URL and content signatures.
-8. Raw content is written to distributed object/chunk storage.
-9. Parsed document events are published to indexing pipelines.
+    subgraph Control["Control Plane"]
+        Frontier["URL Frontier<br/>priority + next_fetch_at"]
+        Scheduler["Crawl Scheduler<br/>leases + politeness"]
+        Robots["robots.txt Service<br/>cached per host"]
+        DNSCache["DNS Cache"]
+        Dedup["Dedup Service<br/>URL + content signatures"]
+    end
 
-**Search serving path**
+    subgraph Data["Data Plane"]
+        Fetchers["Crawler Worker Pool"]
+        Web["External Websites"]
+        Blob["GFS-like Blob Store<br/>raw pages"]
+        Parser["Parser / Link Extractor"]
+        Kafka["Document Events"]
+        Indexer["Index Builders"]
+        ReverseIndex["Reverse Index Shards"]
+        DocStore["Document Metadata Store"]
+        QueryAPI["Search Query API"]
+        QueryCache["Query + Snippet Cache"]
+    end
 
-1. User query enters DNS/CDN/edge.
-2. L7 load balancer routes to Query API.
-3. Query API normalizes terms.
-4. Reverse Index Service returns candidate document IDs.
-5. Ranking service scores candidates.
-6. Document service returns titles and snippets.
-7. Cache stores hot query results and document snippets.
+    Seeds --> Frontier
+    Frontier --> Scheduler
+    Scheduler --> Robots
+    Scheduler --> DNSCache
+    Scheduler --> Fetchers
+    Fetchers --> Web
+    Web --> Fetchers
+    Fetchers --> Blob
+    Fetchers --> Parser
+    Parser --> Dedup
+    Dedup --> Frontier
+    Parser --> Kafka
+    Kafka --> Indexer
+    Indexer --> ReverseIndex
+    Indexer --> DocStore
+    QueryAPI --> QueryCache
+    QueryAPI --> ReverseIndex
+    QueryAPI --> DocStore
 
-**Component placement**
+    style Control fill:#e8f4ff,stroke:#2563eb
+    style Data fill:#ecfdf5,stroke:#059669
+```
 
-| Layer | Component | Role |
-|---|---|---|
-| Frontier | Priority queues / sorted sets | Decide what to crawl next |
-| Fetch | Crawler workers | Download pages safely |
-| Storage | GFS-like distributed blob store | Store raw pages and snapshots |
-| Processing | Kafka + stream/batch jobs | Parse, dedup, index |
-| Index | Inverted index shards | Term -> posting lists |
-| Serving | Query API, rankers, snippet service | Low-latency search results |
-| Cache | Query cache, document cache | Hot result acceleration |
+**Critical path: crawl scheduling**
+
+```mermaid
+sequenceDiagram
+    participant F as URL Frontier
+    participant S as Scheduler
+    participant R as robots.txt Cache
+    participant D as DNS Cache
+    participant W as Crawler Worker
+    participant Site as External Site
+    participant B as Blob Store
+    participant P as Parser
+    participant I as Index Pipeline
+
+    S->>F: lease next URL by priority + next_fetch_at
+    F-->>S: URL + host budget
+    S->>R: check robots rules
+    alt Disallowed
+        S->>F: mark skipped / lower priority
+    else Allowed
+        S->>D: resolve host
+        D-->>S: IP address
+        S->>W: assign crawl job
+        W->>Site: GET page with timeout
+        Site-->>W: HTML response
+        W->>B: store raw page
+        W->>P: parse links + content signature
+        P->>I: publish document event
+        P->>F: enqueue discovered links
+    end
+```
 
 #### 3. Core Component Deep-Dive (Schema definitions, API endpoint definitions, and algorithmic mechanics)
 
-**Crawler APIs**
+**APIs**
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/v1/seeds` | `POST` | Add seed URLs |
 | `/v1/crawl-status/{url_hash}` | `GET` | Inspect crawl status |
 | `/v1/search?q=...` | `GET` | Query indexed documents |
-| `/v1/documents/{doc_id}` | `GET` | Fetch stored document metadata |
+| `/v1/documents/{doc_id}` | `GET` | Fetch document metadata |
 
 **URL frontier schema**
 
@@ -341,9 +426,11 @@ CREATE TABLE url_frontier (
     status VARCHAR(32) NOT NULL
 );
 
+-- Pulls due URLs in priority order for scheduler workers.
 CREATE INDEX idx_frontier_next_fetch
-ON url_frontier (next_fetch_at, priority_score);
+ON url_frontier (next_fetch_at, priority_score DESC);
 
+-- Enforces per-host crawl budgets and politeness windows.
 CREATE INDEX idx_frontier_host
 ON url_frontier (host, next_fetch_at);
 ```
@@ -363,80 +450,66 @@ CREATE TABLE documents (
     raw_object_path TEXT NOT NULL
 );
 
+-- Finds exact duplicate content across different URLs.
 CREATE INDEX idx_documents_content_hash
 ON documents (content_hash);
+
+-- Supports freshness scans and recrawl analytics.
+CREATE INDEX idx_documents_fetched_at
+ON documents (fetched_at);
 ```
 
-**Reverse index model**
+**Concrete posting list example**
 
-```text
-term -> [
-  { doc_id, term_frequency, positions, field_mask, freshness_score },
-  ...
-]
+```json
+{
+  "term": "consistent",
+  "df": 3,
+  "postings": [
+    { "doc_id": 101, "tf": 4, "positions": [12, 84, 130, 220], "fields": ["title", "body"], "score_hint": 0.93 },
+    { "doc_id": 220, "tf": 2, "positions": [44, 91], "fields": ["body"], "score_hint": 0.71 },
+    { "doc_id": 918, "tf": 1, "positions": [17], "fields": ["snippet"], "score_hint": 0.52 }
+  ]
+}
 ```
 
-This is usually stored in specialized index shards, not a generic relational table.
-
-**Crawler mechanics**
-
-| Mechanic | Purpose |
-|---|---|
-| URL canonicalization | Avoid crawling the same page under many URL variants |
-| robots.txt cache | Respect crawl rules without repeated fetches |
-| Per-host politeness | Avoid overwhelming external websites |
-| DNS cache | Reduce lookup overhead |
-| Connection pooling | Avoid repeated TCP handshakes |
-| Content fingerprint | Detect duplicate or near-duplicate pages |
-| Bloom filter | Fast "probably seen" check for URLs |
-| Priority frontier | Crawl important or stale pages first |
-
-**Deduplication**
-
-- Exact duplicate: compare content hash.
-- Near duplicate: use shingles plus Jaccard similarity or cosine similarity.
-- URL duplicate: canonicalize scheme, host, path, query parameters, and trailing slashes.
+Compact production systems often delta-encode sorted `doc_id`s and positions, then compress postings blocks.
 
 #### 4. Scaling & Bottleneck Resolutions (Applying lessons from GFS, Dynamo, and Memcached)
 
-**GFS lesson: separate control flow from data flow**
+**What if...? robots.txt misconfiguration + politeness failure**
 
-The crawler scheduler should not move page bytes. It should assign work and track metadata. Crawler workers write raw pages directly to distributed blob/chunk storage. Indexers consume document events asynchronously.
+> ⚠️ **Failure mode**  
+> A robots cache bug treats missing robots rules as "allow all" and the scheduler ignores per-host budgets. Thousands of workers crawl one domain aggressively, creating external harm and getting the crawler blocked.
 
-| Plane | Responsibility |
+**Walkthrough**
+
+1. robots.txt fetch fails due to timeout.
+2. Bug marks host as fully crawlable.
+3. Frontier has many high-priority URLs for that host.
+4. Scheduler assigns too many workers to the same domain.
+5. External site rate limits or blocks the crawler.
+6. Crawl freshness drops and legal/abuse risk rises.
+
+**Mitigation**
+
+| Step | Action |
 |---|---|
-| Control plane | URL scheduling, politeness, metadata, leases |
-| Data plane | Fetching, storing raw pages, indexing payloads |
+| 1 | Fail closed or conservative when robots state is unknown |
+| 2 | Enforce host-level token bucket regardless of URL priority |
+| 3 | Add global per-domain concurrency caps |
+| 4 | Track HTTP 429/403 spikes and automatically cool down host |
+| 5 | Audit scheduler leases and robots decisions |
 
-**Dynamo lesson: partitioned ownership**
+**Decision log**
 
-Use consistent hashing for URL ownership:
-
-- `hash(host)` for politeness and host-local scheduling.
-- `hash(url)` for dedup and metadata sharding.
-- Replicate frontier shards so workers can recover after failure.
-
-**Memcached lesson: protect hot reads**
-
-Search has hot queries. Cache:
-
-- Popular query result pages.
-- Document snippets.
-- robots.txt by host.
-- DNS results.
-- URL seen checks with Bloom filters.
-
-**Bottlenecks and fixes**
-
-| Bottleneck | Resolution |
-|---|---|
-| Network bandwidth | Distributed fetchers, per-region crawling, compression |
-| DNS overhead | Local DNS cache with refresh and negative caching |
-| External site overload | Per-host rate limits and crawl budgets |
-| Duplicate content explosion | Fingerprinting, Bloom filters, canonicalization |
-| Index write pressure | Kafka buffering and partitioned index builders |
-| Hot search queries | Cache with leases and jittered TTLs |
-| Worker failures | Queue leases, retries, idempotent document writes |
+| Decision | Choice | Rationale |
+|---|---|---|
+| Raw page storage | GFS-like blob/chunk store | Petabyte-scale data plane requires distributed storage |
+| Frontier | Priority queue / sorted-set model | Crawl order depends on freshness and importance |
+| Reverse index | Specialized index shards | Term lookups need posting-list efficiency |
+| Dedup | Hashes + near-duplicate signatures | Prevents graph loops and duplicate storage |
+| Politeness | Host-level scheduler budget | External systems must be protected |
 
 ---
 
@@ -448,103 +521,136 @@ Search has hot queries. Cache:
 
 - Users post tweets.
 - Users follow other users.
-- Home timeline shows recent posts from followed accounts.
-- User timeline shows posts by one user.
+- Home timeline shows followed accounts.
+- User timeline shows one author's tweets.
 - Support likes, replies, reposts, media, and search.
-- Support celebrity accounts with millions of followers.
+- Handle celebrities with millions of followers.
 
 **Non-functional requirements**
 
-- Extremely low read latency for home timeline.
-- High availability for timeline reads.
-- Writes should be durable quickly.
-- Fan-out should not collapse under celebrity posts.
-- Some counters and timelines can be eventually consistent.
+- Low-latency home timeline reads.
+- Durable tweet creation.
+- Eventually consistent timelines and counters are acceptable.
+- Celebrity fan-out must not overload the system.
 
 **Assumptions**
 
 | Input | Value |
 |---|---:|
 | Active users | 100 million |
-| Tweets / day | 500 million |
-| Tweets / month | 15 billion |
-| Average tweet payload + metadata | 10 KB |
-| Average fanout deliveries / tweet | 10 |
-| Home timeline read QPS | 100,000 |
-| Tweet write QPS | 6,000 |
-| Search QPS | 4,000 |
-| Retention estimate | 3 years |
+| Tweets/day | 500 million |
+| Tweets/month | 15 billion |
+| Tweet payload + metadata | 10 KB |
+| Average fanout deliveries/tweet | 10 |
+| Home timeline reads | 100,000 QPS |
+| Tweet writes | 6,000 QPS |
+| Search | 4,000 QPS |
 
-**Storage estimate**
+**Storage**
 
 | Item | Calculation | Result |
 |---|---:|---:|
-| Tweet object storage / month | 15B x 10 KB | 150 TB / month |
-| Tweet object storage / 3 years | 150 TB x 36 | 5.4 PB |
-| Timeline fanout refs / month | 150B deliveries x 16 B ref | 2.4 TB / month |
-| Timeline fanout refs / 3 years | 2.4 TB x 36 | 86.4 TB |
-| Replicated tweet storage factor 3 | 5.4 PB x 3 | 16.2 PB |
+| Tweet object storage/month | 15B x 10 KB | 150 TB |
+| Tweet object storage/3 years | 150 TB x 36 | 5.4 PB |
+| Fanout refs/month | 150B x 16 B | 2.4 TB |
+| Fanout refs/3 years | 2.4 TB x 36 | 86.4 TB |
+| Tweet storage RF=3 | 5.4 PB x 3 | 16.2 PB |
 
-Timeline caches should not store full tweet bodies. Store compact references such as `tweet_id`, `author_id`, and timestamp.
+**QPS and bandwidth**
 
-**QPS estimate**
-
-| Traffic Type | Estimate |
+| Traffic | Estimate |
 |---|---:|
 | Tweet writes | ~6,000 QPS |
 | Home timeline reads | ~100,000 QPS |
-| Fanout deliveries | ~60,000/sec average from prompt assumptions |
+| Fanout deliveries | ~60,000/sec average |
 | Search | ~4,000 QPS |
-| Celebrity fanout | Can spike to millions of followers for one write |
+| Timeline read egress | 100,000 x 50 KB = ~5 GB/s |
 
-**Bandwidth estimate**
-
-| Path | Calculation | Result |
-|---|---:|---:|
-| Tweet write ingress | 6,000 x 10 KB | ~60 MB/s |
-| Timeline read egress | 100,000 x 50 KB response | ~5 GB/s |
-| Fanout refs | 60,000 x 16 B | ~1 MB/s refs only |
-| Media traffic | Offloaded to CDN/object storage | Dominates if included |
+> 📐 **Math check**  
+> If average fanout rises from 10 to 200, fanout deliveries jump from 60,000/sec to ~1.2 million/sec. The hybrid celebrity strategy becomes mandatory, not optional.
 
 #### 2. High-Level Architecture (A clear textual map of component placement)
 
-**Write path**
+```mermaid
+flowchart TB
+    Client["Client"]
+    Edge["DNS + Edge + L7 LB"]
 
-1. Client posts tweet through edge/L7 load balancer.
-2. Tweet Write API validates and stores tweet object.
-3. Tweet ID and metadata are written to durable storage.
-4. Event is published to Kafka: `TweetCreated`.
-5. Fanout service consumes event.
-6. For normal users, fanout service pushes tweet refs into followers' Redis home timeline buckets.
-7. For celebrities, skip mass push and mark tweet for fan-out-on-read retrieval.
+    subgraph Control["Control Plane"]
+        WriteAPI["Tweet Write API"]
+        Graph["Follow Graph Service"]
+        Classifier["Author Classifier<br/>normal vs celebrity"]
+        Kafka["Kafka<br/>TweetCreated"]
+        Fanout["Fanout Workers"]
+    end
 
-**Read path**
+    subgraph Data["Data Plane"]
+        TweetStore["Tweet Store"]
+        Redis["Redis Timeline Buckets"]
+        Search["Search / Recent Tweet Index"]
+        TweetInfo["Tweet Info Service"]
+        UserInfo["User Info Service"]
+        ReadAPI["Timeline Read API"]
+        Media["Object Storage + CDN"]
+    end
 
-1. Client requests home timeline.
-2. Read API fetches home timeline refs from Redis.
-3. Read API fetches tweet bodies via Tweet Info Service using multiget.
-4. User Info Service provides author profiles.
-5. For followed celebrities, Read API pulls recent celebrity tweets at request time.
-6. Ranking/merge layer combines cached timeline refs and celebrity pull results.
-7. Response is returned to client.
+    Client --> Edge
+    Edge -->|"POST /v1/tweets"| WriteAPI
+    WriteAPI --> TweetStore
+    WriteAPI --> Media
+    WriteAPI --> Kafka
+    Kafka --> Classifier
+    Classifier -->|"normal author"| Fanout
+    Fanout --> Graph
+    Fanout --> Redis
+    Classifier -->|"celebrity author"| Search
 
-**Component placement**
+    Edge -->|"GET /v1/timeline/home"| ReadAPI
+    ReadAPI --> Redis
+    ReadAPI --> Search
+    ReadAPI --> TweetInfo
+    ReadAPI --> UserInfo
+    ReadAPI --> Client
 
-| Layer | Component | Role |
-|---|---|---|
-| Edge | DNS, CDN, L7 LB | Global routing, TLS, rate limits |
-| API | Tweet Write API, Timeline Read API | Separate write/read scaling |
-| Graph | Follow Graph Service | follower/following lists |
-| Async | Kafka | TweetCreated event buffering |
-| Fanout | Fanout workers | Push tweet refs to timelines |
-| Cache | Redis timeline buckets | Fast home timeline reads |
-| Storage | Tweet store, user store, graph store | Durable data |
-| Search | Search/index cluster | Pull celebrity tweets and keyword search |
-| Media | Object storage + CDN | Image/video delivery |
+    style Control fill:#e8f4ff,stroke:#2563eb
+    style Data fill:#ecfdf5,stroke:#059669
+```
+
+**Critical path: home timeline fan-out**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant W as Tweet Write API
+    participant T as Tweet Store
+    participant K as Kafka
+    participant F as Fanout Worker
+    participant G as Follow Graph
+    participant R as Redis Timelines
+    participant S as Search Index
+    participant H as Timeline Read API
+
+    C->>W: POST /v1/tweets
+    W->>T: persist tweet
+    W->>K: publish TweetCreated
+    W-->>C: 201 Created
+    K->>F: consume event
+    F->>G: get followers(author_id)
+    alt Normal author
+        F->>R: LPUSH tweet_ref into follower timelines
+        F->>R: LTRIM timeline buckets
+    else Celebrity author
+        F->>S: index tweet for read-time pull
+    end
+    C->>H: GET /v1/timeline/home
+    H->>R: read pushed timeline refs
+    H->>S: pull recent celebrity tweets
+    H-->>C: merged ranked timeline
+```
 
 #### 3. Core Component Deep-Dive (Schema definitions, API endpoint definitions, and algorithmic mechanics)
 
-**API endpoints**
+**APIs**
 
 | Endpoint | Method | Purpose |
 |---|---|---|
@@ -555,7 +661,7 @@ Timeline caches should not store full tweet bodies. Store compact references suc
 | `/v1/users/{user_id}/follow` | `DELETE` | Unfollow user |
 | `/v1/search/tweets?q=...` | `GET` | Search tweets |
 
-**Tweet schema**
+**Schema**
 
 ```sql
 CREATE TABLE tweets (
@@ -568,13 +674,10 @@ CREATE TABLE tweets (
     reply_to_tweet_id BIGINT NULL
 );
 
+-- Supports user timeline reads in reverse chronological order.
 CREATE INDEX idx_tweets_author_created
 ON tweets (author_id, created_at DESC);
-```
 
-**Follow graph schema**
-
-```sql
 CREATE TABLE follows (
     follower_id BIGINT NOT NULL,
     followee_id BIGINT NOT NULL,
@@ -582,55 +685,29 @@ CREATE TABLE follows (
     PRIMARY KEY (follower_id, followee_id)
 );
 
+-- Supports fanout lookup: who follows this author?
 CREATE INDEX idx_follows_followee
 ON follows (followee_id);
 ```
 
-At high scale, the follow graph is often stored in a graph-optimized or wide-column store partitioned by user ID.
-
-**Redis home timeline bucket**
+**Redis bucket**
 
 ```text
-home_timeline:{user_id} -> list[
-  { tweet_id, author_id, created_at }
+home_timeline:{user_id} -> [
+  { tweet_id, author_id, created_at },
+  ...
 ]
 ```
 
-Keep only the most recent N entries, such as 800 to 1,000 refs. Older timeline pages can be reconstructed from durable stores.
+Store compact refs, not full tweet bodies.
 
-**Fan-out on write**
-
-1. User posts tweet.
-2. Fanout service gets follower IDs.
-3. For each follower, append tweet ref to `home_timeline:{follower_id}`.
-4. Trim list to max length.
-
-Strength: home reads are extremely fast.
-
-Weakness: celebrity posts create huge write amplification.
-
-**Fan-out on read**
-
-1. User requests timeline.
-2. Read API fetches list of followed accounts.
-3. Query recent tweets from those accounts.
-4. Merge and rank at read time.
-
-Strength: no massive write fanout.
-
-Weakness: reads become expensive.
-
-**Hybrid model**
-
-- Normal users: fan-out on write.
-- Celebrities/power users: fan-out on read.
-- Timeline service merges cached push timeline with pulled celebrity tweets.
+**Push vs pull fan-out**
 
 ```mermaid
 flowchart TB
     Client["Client"]
     WriteAPI["Tweet Write API"]
-    TweetStore["Tweet Store<br/>durable source of truth"]
+    TweetStore["Tweet Store"]
     Kafka["Kafka Topic<br/>TweetCreated"]
     Graph["Follow Graph Service"]
 
@@ -681,45 +758,261 @@ flowchart TB
 
 #### 4. Scaling & Bottleneck Resolutions (Applying lessons from GFS, Dynamo, and Memcached)
 
-**Celebrity fanout**
+**What if...? Celebrity tweet + read-time merge breakdown**
 
-| Problem | Resolution |
+> ⚠️ **Failure mode**  
+> A celebrity tweet is not pushed to follower timelines. It must be pulled and merged at read time. If the search/recent-tweet index lags or fails, users miss celebrity tweets while their cached normal timeline still loads.
+
+**Walkthrough**
+
+1. Celebrity posts tweet.
+2. Tweet is persisted and indexed for pull model.
+3. Search index falls behind.
+4. Timeline Read API reads Redis timeline refs successfully.
+5. Celebrity pull query times out.
+6. Users see a stale timeline missing celebrity content.
+
+**Mitigation**
+
+| Step | Action |
 |---|---|
-| Millions of followers cause write explosion | Hybrid fanout: pull celebrity tweets at read time |
-| Timeline cache write storm | Kafka partitions + fanout workers with backpressure |
-| Followers see delayed celebrity post | Read-time merge from search/tweet index |
+| 1 | Keep a small dedicated recent-tweets cache for celebrity authors |
+| 2 | Use timeout-bounded merge and return partial results |
+| 3 | Mark response as degraded for observability |
+| 4 | Fall back to Tweet Store query for followed celebrity IDs when safe |
+| 5 | Backpressure celebrity indexing independently from normal fanout |
 
-**Cache failure**
+> 🧠 **Staff-engineer note**  
+> The hybrid timeline model creates two correctness paths: pushed normal tweets and pulled celebrity tweets. The merge layer must be observable as its own dependency, not hidden inside the read API.
 
-At 100,000 timeline reads/sec, cache failure can crush the durable stores.
+**Decision log**
 
-Apply Facebook Memcached lessons:
+| Decision | Choice | Rationale |
+|---|---|---|
+| Timeline refs | Redis lists | O(1) recent timeline reads |
+| Fanout model | Hybrid push/pull | Normal users optimize reads; celebrities avoid write explosion |
+| Event transport | Kafka | Fanout needs partitioning, replay, and backpressure |
+| Media | Object storage + CDN | Large media should not pass through tweet DB |
+| Cache failure | Gutter pool + leases | Prevents cache outage from crushing stores |
 
-- Gutter pools for cache node outages.
-- Lease tokens to prevent stampedes.
-- Remote markers for read-after-write consistency across regions.
-- mcrouter-style routing layer to isolate clients from cache topology.
-- UDP or optimized protocols for high-volume cache gets where safe.
+---
 
-**Dynamo lesson**
+### Live Comments System
 
-For likes, counters, and some timeline metadata, prefer AP-style availability and reconcile asynchronously. For tweet creation and delete visibility, use stronger write paths and durable event logs.
+#### 1. Requirements & Bounding (Include clear calculation tables for Storage, QPS, and Bandwidth numbers)
 
-**GFS lesson**
+**Functional requirements**
 
-Media should not flow through the tweet database. Store media in object/chunk storage and serve through CDN. Keep Tweet Store as metadata/control plane; media storage is the data plane.
+- Users join a live stream comment room.
+- Users post comments.
+- Viewers receive comments in near real time.
+- Moderators can delete or suppress comments.
+- Late joiners receive recent history.
+- System supports high-traffic live events.
 
-**Backpressure**
+**Non-functional requirements**
 
-Fanout is asynchronous. If Redis or graph service slows:
+- Low-latency fanout over WebSockets.
+- Per-room ordering is preferred.
+- Duplicate message delivery must not duplicate display.
+- Moderation actions must propagate quickly.
+- System must isolate hot live rooms.
 
-- Kafka lag grows.
-- Fanout workers reduce concurrency.
-- Non-critical fanout can degrade.
-- Home timelines may temporarily omit freshest tweets.
-- User timeline remains available from Tweet Store.
+**Assumptions**
 
-Graceful degradation: show slightly stale home timeline rather than fail the app.
+| Input | Value |
+|---|---:|
+| Concurrent viewers for large event | 1 million |
+| Active commenters | 1% of viewers |
+| Comment rate/commenter | 1 comment / 30 sec |
+| Average message payload | 300 B |
+| Recent replay window | 5 minutes |
+
+**QPS**
+
+| Traffic | Calculation | Result |
+|---|---:|---:|
+| Active commenters | 1,000,000 x 1% | 10,000 |
+| Comment writes | 10,000 / 30 sec | ~333 QPS |
+| Fanout deliveries | 333 x 1,000,000 | impossible as direct per-message fanout |
+| WebSocket connections | 1,000,000 viewers | 1M long-lived sockets |
+
+**Storage and bandwidth**
+
+| Item | Calculation | Result |
+|---|---:|---:|
+| Raw comments/hour | 333/sec x 3,600 x 300 B | ~360 MB/hour |
+| 24h raw comments | 360 MB x 24 | ~8.6 GB/day for one huge room |
+| Direct fanout bandwidth | 333/sec x 1M x 300 B | ~100 GB/sec |
+
+> 📐 **Math check**  
+> Directly sending every comment to every viewer does not scale. Large rooms need sampling, batching, ranking, regional fanout trees, or client-side throttling.
+
+#### 2. High-Level Architecture (A clear textual map of component placement)
+
+```mermaid
+flowchart LR
+    Client["Web/Mobile Client"]
+
+    subgraph Control["Control Plane"]
+        Edge["Edge WebSocket Gateway"]
+        Auth["Auth + Room Admission"]
+        Router["Room Router<br/>room_id -> shard"]
+        Moderation["Moderation Service"]
+        Presence["Presence Service"]
+    end
+
+    subgraph Data["Data Plane"]
+        Ingest["Comment Ingest API"]
+        Broker["Pub/Sub Broker<br/>room partitions"]
+        Buffers["Sharded Recent Message Buffers"]
+        Fanout["Regional Fanout Workers"]
+        Store["Durable Comment Store"]
+        DLQ["Moderation / Delivery DLQ"]
+    end
+
+    Client --> Edge
+    Edge --> Auth
+    Auth --> Router
+    Client -->|"post comment"| Ingest
+    Ingest --> Moderation
+    Moderation --> Broker
+    Broker --> Buffers
+    Broker --> Fanout
+    Fanout --> Edge
+    Edge -->|"batched comments"| Client
+    Broker --> Store
+    Broker --> DLQ
+    Presence --> Router
+
+    style Control fill:#e8f4ff,stroke:#2563eb
+    style Data fill:#ecfdf5,stroke:#059669
+```
+
+**Critical path: comment delivery**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant E as WebSocket Gateway
+    participant I as Ingest API
+    participant M as Moderation
+    participant B as Pub/Sub Broker
+    participant F as Fanout Worker
+    participant R as Recent Buffer
+    participant S as Durable Store
+
+    C->>E: WebSocket connect(room_id)
+    E->>R: fetch recent replay window
+    R-->>E: recent comments
+    E-->>C: replay recent comments
+    C->>I: post comment(idempotency_key, room_id, body)
+    I->>M: validate / score
+    alt Allowed
+        M->>B: publish CommentCreated(room_id key)
+        B->>S: append durable log
+        B->>R: append recent buffer
+        B->>F: deliver to room shard
+        F->>E: batched fanout
+        E-->>C: comment event
+    else Blocked
+        M-->>I: reject
+        I-->>C: moderation rejection
+    end
+```
+
+#### 3. Core Component Deep-Dive (Schema definitions, API endpoint definitions, and algorithmic mechanics)
+
+**APIs**
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/v1/live/{room_id}/connect` | WebSocket | Join comment stream |
+| `/v1/live/{room_id}/comments` | `POST` | Submit comment |
+| `/v1/live/{room_id}/comments/recent` | `GET` | Fetch recent replay |
+| `/v1/live/{room_id}/moderation/{comment_id}` | `DELETE` | Remove comment |
+
+**Comment schema**
+
+```sql
+CREATE TABLE live_comments (
+    room_id BIGINT NOT NULL,
+    comment_id BIGINT NOT NULL,
+    author_id BIGINT NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    body TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    moderation_state VARCHAR(32) NOT NULL,
+    PRIMARY KEY (room_id, comment_id)
+);
+
+-- Prevents duplicate comments when clients retry POST after timeout.
+CREATE UNIQUE INDEX idx_live_comments_idempotency
+ON live_comments (room_id, author_id, idempotency_key);
+
+-- Supports recent replay when a viewer joins a live room.
+CREATE INDEX idx_live_comments_room_created
+ON live_comments (room_id, created_at DESC);
+```
+
+**Idempotency example**
+
+```json
+{
+  "room_id": "stream-900",
+  "idempotency_key": "user-77:stream-900:msg-00042",
+  "body": "This launch is incredible"
+}
+```
+
+**Algorithmic mechanics**
+
+| Mechanic | Purpose |
+|---|---|
+| Shard by `room_id` | Keeps per-room ordering manageable |
+| Batch fanout | Reduces per-message network overhead |
+| Recent buffer | Supports late join replay |
+| Regional fanout tree | Avoids one central broadcaster |
+| Moderation queue | Separates safety processing from socket delivery |
+| Client sequence numbers | Deduplicate repeated delivery |
+
+#### 4. Scaling & Bottleneck Resolutions (Applying lessons from GFS, Dynamo, and Memcached)
+
+**What if...? Hot room overwhelms fanout**
+
+> ⚠️ **Failure mode**  
+> A major live event reaches 1 million viewers. Every comment cannot be sent individually to every socket. Fanout workers saturate and WebSocket gateways build memory queues.
+
+**Walkthrough**
+
+1. A live stream becomes globally popular.
+2. Comment rate rises to hundreds or thousands of messages per second.
+3. Fanout workers attempt to broadcast every message to every connected viewer.
+4. WebSocket gateway send buffers grow.
+5. Slow clients hold memory and connection resources.
+6. Gateways begin dropping connections or timing out heartbeats.
+7. Viewers see delayed, duplicated, or missing comments.
+
+**Mitigation**
+
+| Step | Action |
+|---|---|
+| 1 | Batch comments into 250-500 ms frames |
+| 2 | Apply per-room rate limits and slow-mode |
+| 3 | Use ranked/top comments for enormous rooms |
+| 4 | Shard viewers by region and gateway |
+| 5 | Drop non-critical comments before dropping connections |
+| 6 | Keep recent replay buffer so clients can resync |
+
+**Decision log**
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Client protocol | WebSockets | Bidirectional low-latency updates |
+| Broker | Partitioned pub/sub | Room-based ordering and fanout |
+| Storage | Append-oriented comment log | Replay, audit, moderation |
+| Dedup | Idempotency key + client sequence | Required under retries |
+| Hot-room strategy | Batching + ranking + regional fanout | Direct broadcast is too expensive |
 
 ---
 
