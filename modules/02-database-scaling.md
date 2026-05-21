@@ -27,36 +27,68 @@ This module is a definitive reference for distributed storage trade-offs, combin
 
 ```mermaid
 flowchart TD
-    Start["Start: What does the data need?"]
+    Start["Start: What is the dominant access pattern?"]
+    Metrics["Is it append-heavy metrics/events<br/>queried by time windows?"]
+    GraphQ["Are traversals over relationships<br/>the core query?"]
+    SearchQ["Is the core query text/ranking/filter search?"]
     Txn["Do you need multi-row ACID transactions<br/>or strict invariants?"]
-    Joins["Do you need rich joins and ad hoc queries?"]
-    WriteScale["Is write volume too high for one primary<br/>or one vertical SQL cluster?"]
-    Access["Are access patterns known and key-based?"]
-    Global["Do you need global low-latency writes?"]
-    NewSQLFit["Can you pay coordination latency<br/>for distributed SQL semantics?"]
+    Joins["Do you need rich joins or ad hoc reporting<br/>on normalized data?"]
+    JoinShape["Are joins mostly local to one entity/tenant<br/>or cross-partition/global?"]
+    WriteScale["Can one primary or one vertical SQL cluster<br/>handle write QPS with headroom?"]
+    GlobalWrites["Do you need globally distributed writes<br/>with strong consistency?"]
+    CoordinationOK["Can the product tolerate consensus/clock<br/>coordination latency on writes?"]
+    KnownAccess["Are access patterns known, key-based,<br/>and denormalizable?"]
+    WriteVolume["Is write volume or availability under partition<br/>more important than immediate consistency?"]
     SQL["Traditional SQL<br/>Postgres/MySQL"]
-    SQLScale["SQL + replicas + partitioning<br/>then shard/federate carefully"]
-    NoSQL["NoSQL / Dynamo-style KV or wide-column"]
-    NewSQL["NewSQL<br/>Spanner/CockroachDB-style"]
-    Search["Specialized index/search store"]
+    SQLPartitioned["SQL + read replicas + partitioning<br/>then shard/federate carefully"]
+    NewSQL["NewSQL / Distributed SQL<br/>Spanner/CockroachDB/YugabyteDB"]
+    KV["NoSQL KV / Wide-column<br/>Dynamo/Cassandra-style"]
+    Doc["Document Store<br/>MongoDB-style"]
+    Search["Search Index<br/>Elasticsearch/OpenSearch/Solr"]
+    TS["Time-Series Store<br/>Timescale/Influx/Prometheus"]
+    Graph["Graph Store<br/>Neo4j/JanusGraph"]
 
-    Start --> Txn
+    Start --> Metrics
+    Metrics -->|"Yes"| TS
+    Metrics -->|"No"| GraphQ
+    GraphQ -->|"Yes"| Graph
+    GraphQ -->|"No"| SearchQ
+    SearchQ -->|"Yes"| Search
+    SearchQ -->|"No"| Txn
+
     Txn -->|"Yes"| Joins
-    Txn -->|"No"| Access
-    Joins -->|"Yes"| WriteScale
-    Joins -->|"No, mostly key-value"| Access
-    WriteScale -->|"No"| SQL
-    WriteScale -->|"Yes"| NewSQLFit
-    NewSQLFit -->|"Yes"| NewSQL
-    NewSQLFit -->|"No"| SQLScale
-    Access -->|"Yes, predictable key access"| Global
-    Access -->|"No, search/ranking/text"| Search
-    Global -->|"Yes, availability over immediate consistency"| NoSQL
-    Global -->|"No"| SQLScale
+    Txn -->|"No"| KnownAccess
+    Joins -->|"Yes"| JoinShape
+    Joins -->|"No, mostly aggregate/document per entity"| KnownAccess
+    JoinShape -->|"Mostly local joins"| WriteScale
+    JoinShape -->|"Cross-shard/global joins are common"| GlobalWrites
+    WriteScale -->|"Yes"| SQL
+    WriteScale -->|"No"| GlobalWrites
+    GlobalWrites -->|"Yes"| CoordinationOK
+    GlobalWrites -->|"No, regional writes are enough"| SQLPartitioned
+    CoordinationOK -->|"Yes"| NewSQL
+    CoordinationOK -->|"No"| SQLPartitioned
+
+    KnownAccess -->|"Yes, simple key/range queries"| WriteVolume
+    KnownAccess -->|"Nested documents, flexible shape"| Doc
+    KnownAccess -->|"No, ad hoc analytics/search dominates"| Search
+    WriteVolume -->|"Yes"| KV
+    WriteVolume -->|"No"| SQLPartitioned
 ```
 
 > 🧠 **Staff-engineer note**  
 > The correct database is usually not "SQL vs NoSQL." It is "which invariants must be enforced synchronously, and which views can be rebuilt asynchronously?"
+
+### Decision Questions To Say Out Loud
+
+| Question | Why It Matters | Typical Direction |
+|---|---|---|
+| Do writes need multi-row invariants? | Determines whether ACID transactions are part of the core data model | SQL or NewSQL |
+| Are joins on the hot path? | Cross-shard joins are one of the fastest ways to make a sharded system slow | SQL if local; denormalize or NewSQL if global |
+| Is the workload read-heavy, write-heavy, or append-heavy? | Storage engines optimize different write/read shapes | SQL/KV/time-series |
+| Can stale reads be tolerated? | Opens up replicas, caches, AP stores, and async materialized views | NoSQL or CQRS-style architecture |
+| Is the main query text, graph traversal, or time-window aggregation? | Specialized stores beat general-purpose databases for specialized access patterns | Search, graph, or time-series |
+| Can you operate distributed consensus safely? | NewSQL reduces app complexity but increases cluster and latency complexity | NewSQL only when the trade is worth it |
 
 ---
 
@@ -88,6 +120,21 @@ In a distributed database, replicas communicate over a network that can drop, de
 | **NewSQL** | High horizontal scale for SQL workloads | Higher than local SQL due to consensus/clock coordination | Strong distributed transactions | High: operational and latency complexity |
 
 **NewSQL difference:** systems such as Spanner and CockroachDB aim to preserve SQL and ACID semantics across distributed nodes, usually by using consensus and carefully managed replication. They reduce application-level sharding pain, but coordination latency is still real.
+
+### NewSQL Comparison: Spanner/CockroachDB vs. SQL vs. NoSQL
+
+NewSQL is best understood as a trade: you keep SQL and strong transactions across nodes, but you pay for distributed coordination. It is not "SQL, but magically infinite."
+
+| Dimension | Traditional SQL | NewSQL / Distributed SQL | NoSQL / Dynamo-Style |
+|---|---|---|---|
+| **ACID guarantees** | Strong inside one primary/cluster; cross-shard transactions are hard | Strong distributed transactions across ranges/replicas | Usually per-item or per-partition; app handles conflicts |
+| **Global writes latency** | Low in one region; high or awkward across regions | Higher because consensus/clock coordination crosses replicas | Low if accepting local/quorum writes with eventual convergence |
+| **Rebalancing ease** | Manual partitioning/sharding unless managed service helps | Automatic range movement is a core feature | Often automatic token/range ownership, but data model still matters |
+| **Operational complexity** | Familiar, but failover and sharding are painful at scale | Complex consensus, placement, clock, and topology operations | Complex reconciliation, repair, compaction, and access-pattern modeling |
+| **Join support** | Excellent before sharding; cross-shard joins degrade | SQL joins exist, but distributed joins can be expensive | Usually avoided; denormalize for query paths |
+| **Best fit** | OLTP apps with clear relational model and moderate write scale | Strongly consistent multi-region business data | High-scale key-based access and availability under partitions |
+
+Interview phrasing: choose NewSQL when distributed transactions are central to the product and the team accepts write latency and operational complexity. Choose NoSQL when availability and write scale matter more than immediate global consistency. Choose traditional SQL when the relational model fits and a single primary or carefully partitioned deployment is enough.
 
 ---
 
@@ -169,20 +216,39 @@ A good shard key should:
 
 ## 6. Sharding Hotspot: Celebrity Key
 
+One of the most common sharding interview traps is assuming that even row distribution means even traffic distribution.
+
+### Case Study: Celebrity Profile Launch
+
+A social network shards profile data by `user_id`. The celebrity `celebrity-123` goes live during a major event.
+
+Assumptions:
+
+| Input | Value |
+|---|---:|
+| Total shards | 64 |
+| Normal profile reads | 200,000 QPS |
+| Celebrity profile reads during event | 1,500,000 QPS |
+| Per-shard sustainable reads | 40,000 QPS from primary + replicas |
+| Celebrity shard before event | 8,000 QPS |
+| Celebrity shard during event | 1,508,000 QPS |
+
 ```mermaid
 flowchart LR
-    Requests["Millions of requests<br/>profile:celebrity-123"]
+    Clients["Mobile/Web Clients<br/>1.5M QPS for celebrity-123"]
+    Edge["Edge Cache / API Gateway"]
     Router["Shard Router<br/>hash(user_id)"]
 
     subgraph Shards["Database Shards"]
         S1["Shard 1<br/>10% CPU"]
         S2["Shard 2<br/>12% CPU"]
-        S3["Shard 3<br/>99% CPU<br/>celebrity-123 lives here"]
+        S3["Shard 3<br/>100% CPU<br/>queueing + timeouts<br/>celebrity-123 lives here"]
         S4["Shard 4<br/>8% CPU"]
     end
 
-    Requests --> Router
-    Router --> S3
+    Clients --> Edge
+    Edge -->|"cache miss / personalized read"| Router
+    Router -->|"hash(celebrity-123)"| S3
     Router -. ordinary users .-> S1
     Router -. ordinary users .-> S2
     Router -. ordinary users .-> S4
@@ -193,16 +259,39 @@ flowchart LR
     style S4 fill:#ecfdf5,stroke:#059669
 ```
 
+### Failure Timeline
+
+| Time | Event | System Effect |
+|---:|---|---|
+| T+0s | Celebrity posts link to profile during live event | Requests concentrate on one logical key |
+| T+5s | Edge cache hit ratio drops because profile includes viewer-specific fields | Router sends most requests to the owning shard |
+| T+10s | Shard 3 saturates CPU and DB connection pool | Latency rises from 20 ms to 2+ seconds |
+| T+20s | API retries time out requests | Retry amplification increases load on the same shard |
+| T+40s | Replica lag grows on Shard 3 | Reads from replicas become stale or unavailable |
+| T+60s | Global error rate rises despite other shards being idle | Cluster capacity looks healthy, but the hot key is failing |
+| T+120s | Operators enable emergency cache and degrade personalized fields | Profile becomes readable again with slightly stale counters |
+
 ### Hotspot Mitigations
 
-| Technique | Use When |
-|---|---|
-| **Read replicas for hot shard** | Hot key is read-heavy |
-| **Cache hot object** | Same object read repeatedly |
-| **Split logical key** | Comments, counters, likes can be bucketed |
-| **Dedicated shard / tenant isolation** | One tenant or celebrity dominates |
-| **Adaptive partitioning** | Storage engine can split hot ranges/items |
-| **Rate limits and backpressure** | Protect system while rebalancing |
+| Mitigation | Use When | Pros | Cons |
+|---|---|---|---|
+| **Cache hot object** | Same profile or metadata is read repeatedly | Fastest relief; protects DB; cheap | Hard for personalized fields; stale data risk |
+| **Read replicas for hot shard** | Hot key is read-heavy and replicas can serve stale-ish reads | Increases read capacity without changing key | Lag and replica fanout still concentrate on one shard group |
+| **Split logical key** | Comments, likes, counters, and timelines can be bucketed | Spreads writes/reads across subkeys | Application must merge buckets; ordering gets harder |
+| **Dedicated partition/shard** | One tenant or celebrity predictably dominates | Isolates blast radius and capacity planning | Operational exception path; migrations required |
+| **Materialized public profile** | Public view can be precomputed separately from private viewer fields | High cacheability; simple emergency degradation | Needs async update pipeline |
+| **Adaptive partitioning** | Storage engine supports splitting hot ranges/items | Reduces manual work | Cannot always split a single hot item |
+| **Rate limits and backpressure** | System needs survival while rebalancing | Stops retry storms and protects neighbors | User-visible degradation |
+
+### Design Lesson
+
+Do not shard only by *storage ownership*. Also model:
+
+- QPS per key.
+- Cacheability per key.
+- Retry behavior under timeout.
+- Whether one key can be split into independent subkeys.
+- Whether large tenants or celebrities need placement exceptions.
 
 ---
 
@@ -454,6 +543,62 @@ if __name__ == "__main__":
     print(f"\nMoved sampled keys: {len(moved)} / {len(keys)}")
 ```
 
+### Unit Test Example
+
+```python
+import pytest
+
+
+def test_same_key_routes_to_same_node() -> None:
+    ring = ConsistentHashRing(["db-a", "db-b", "db-c"], replicas=64)
+
+    assert ring.get_node("user:42") == ring.get_node("user:42")
+
+
+def test_adding_node_moves_only_some_keys() -> None:
+    keys = [f"user:{i}" for i in range(5_000)]
+    ring = ConsistentHashRing(["db-a", "db-b", "db-c"], replicas=128)
+
+    finish_watch = ring.watch_ownership_changes(keys, "add db-d")
+    ring.add_node("db-d")
+    moved = finish_watch()
+
+    moved_ratio = len(moved) / len(keys)
+
+    # Adding a fourth node should move roughly 25% of keys. The range is wide
+    # because this is a deterministic sample over a finite key set.
+    assert 0.15 <= moved_ratio <= 0.35
+
+
+def test_remove_node_never_routes_to_removed_node() -> None:
+    keys = [f"user:{i}" for i in range(1_000)]
+    ring = ConsistentHashRing(["db-a", "db-b", "db-c"], replicas=128)
+
+    ring.remove_node("db-b")
+
+    assert "db-b" not in ring.nodes()
+    assert all(ring.get_node(key) != "db-b" for key in keys)
+
+
+def test_replica_selection_uses_distinct_physical_nodes() -> None:
+    ring = ConsistentHashRing(["db-a", "db-b", "db-c"], replicas=128)
+
+    replicas = ring.get_replicas("cart:123", count=3)
+
+    assert len(replicas) == 3
+    assert len(set(replicas)) == 3
+```
+
+### Ownership Watch Output
+
+Example log when adding a fourth node:
+
+```text
+INFO:__main__:ring operation=add db-d moved_keys=2471 total_keys=10000
+```
+
+That number should be close to 25% for a fourth equally weighted node. If it is 60%, the ring is unstable. If it is 2%, the new node is underutilized.
+
 > 🧠 **Staff-engineer note**  
 > Consistent hashing balances key ownership, not request rate. A single hot key can still overwhelm one node.
 
@@ -577,6 +722,97 @@ print(merge_cart_siblings(siblings, resolver_node="R"))
 > ⚠️ **Failure mode**  
 > Last-write-wins would silently drop either `book` or `pen`. That is unacceptable for carts, balances, permissions, and collaborative editing.
 
+### Calendar Invite Conflict Example
+
+Calendar invites are trickier than carts because some fields are mergeable and others are not.
+
+Concurrent updates:
+
+| Client | Change | Vector Clock |
+|---|---|---|
+| Client 1 via node `B` | Adds attendee `amina@example.com` | `{A: 4, B: 1}` |
+| Client 2 via node `C` | Changes room to `Room 9` | `{A: 4, C: 1}` |
+| Client 3 via node `D` | Changes start time to `10:30` | `{A: 4, D: 1}` |
+
+Safe merge policy:
+
+| Field | Merge Strategy |
+|---|---|
+| Attendees | Union additions and removals using operation IDs when available |
+| Location | Pick latest user-confirmed value or require user review if concurrent |
+| Start/end time | Require organizer review when concurrent with another time edit |
+| Description | Use document merge or last-writer with edit history |
+
+```python
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, Set
+
+
+def merge_calendar_invite_siblings(siblings: Iterable[Dict[str, Any]], resolver_node: str) -> Dict[str, Any]:
+    attendees: Set[str] = set()
+    vector_clock: Dict[str, int] = {}
+    locations: Set[str] = set()
+    start_times: Set[str] = set()
+    descriptions: list[str] = []
+
+    for sibling in siblings:
+        attendees.update(sibling.get("attendees", []))
+        if sibling.get("location"):
+            locations.add(sibling["location"])
+        if sibling.get("start_time"):
+            start_times.add(sibling["start_time"])
+        if sibling.get("description"):
+            descriptions.append(sibling["description"])
+
+        for node, counter in sibling["vector_clock"].items():
+            vector_clock[node] = max(vector_clock.get(node, 0), counter)
+
+    vector_clock[resolver_node] = vector_clock.get(resolver_node, 0) + 1
+
+    needs_review = len(locations) > 1 or len(start_times) > 1
+
+    return {
+        "attendees": sorted(attendees),
+        "location": next(iter(locations)) if len(locations) == 1 else None,
+        "start_time": next(iter(start_times)) if len(start_times) == 1 else None,
+        "description": descriptions[-1] if descriptions else "",
+        "needs_organizer_review": needs_review,
+        "conflicting_locations": sorted(locations),
+        "conflicting_start_times": sorted(start_times),
+        "vector_clock": vector_clock,
+    }
+
+
+siblings = [
+    {
+        "attendees": ["amina@example.com"],
+        "location": "Room 4",
+        "start_time": "10:00",
+        "description": "Planning",
+        "vector_clock": {"A": 4, "B": 1},
+    },
+    {
+        "attendees": [],
+        "location": "Room 9",
+        "start_time": "10:00",
+        "description": "Planning",
+        "vector_clock": {"A": 4, "C": 1},
+    },
+    {
+        "attendees": [],
+        "location": "Room 4",
+        "start_time": "10:30",
+        "description": "Planning",
+        "vector_clock": {"A": 4, "D": 1},
+    },
+]
+
+print(merge_calendar_invite_siblings(siblings, resolver_node="R"))
+```
+
+The key insight: reconciliation is application-specific. Cart item union may be safe. Calendar time conflicts often need human review. Bank balance conflicts should never be merged this way.
+
 ---
 
 ## 11. GFS: Control Plane vs. Data Plane
@@ -605,6 +841,65 @@ Design lesson: keep high-volume data flow away from centralized metadata control
 | **Correct data types** | Smaller rows improve cache density | Bad choices require migrations |
 | **Table partitioning** | Prunes scans and simplifies retention | Planner and operational complexity |
 | **Denormalization** | Avoids expensive joins | Slower writes and consistency repair |
+
+### Covering Index Visualization
+
+Query:
+
+```sql
+SELECT order_id, status, created_at
+FROM orders
+WHERE customer_id = 42
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Without a covering index, the database finds matching index entries and then jumps back to the table for missing columns.
+
+```mermaid
+flowchart LR
+    Q["Query<br/>customer_id=42<br/>order by created_at"]
+
+    subgraph NonCovering["Non-covering index"]
+        I1["Index<br/>(customer_id, created_at)<br/>contains row pointers"]
+        T1["Table heap / clustered rows<br/>fetch status, order_id"]
+        R1["Return rows"]
+    end
+
+    subgraph Covering["Covering index"]
+        I2["Index<br/>(customer_id, created_at)<br/>INCLUDE (order_id, status)"]
+        R2["Return rows<br/>index-only scan"]
+    end
+
+    Q --> I1 --> T1 --> R1
+    Q --> I2 --> R2
+
+    style T1 fill:#fee2e2,stroke:#dc2626
+    style I2 fill:#ecfdf5,stroke:#059669
+```
+
+Example covering index:
+
+```sql
+CREATE INDEX idx_orders_customer_created_covering
+ON orders (customer_id, created_at DESC)
+INCLUDE (order_id, status);
+```
+
+The win is avoiding random table lookups for every matched row. The cost is extra index storage and slower writes.
+
+### Common SQL Tuning Mistakes
+
+- Not using `EXPLAIN` / `EXPLAIN ANALYZE` before guessing.
+- Using functions on indexed columns, such as `DATE(created_at) = '2026-05-21'`, which can prevent normal index use.
+- Creating single-column indexes when the query needs a composite index in the right column order.
+- Forgetting that low-cardinality indexes, such as `status`, may not be selective enough alone.
+- Selecting too many columns and preventing index-only scans.
+- Adding indexes without measuring write amplification and storage cost.
+- Ignoring pagination shape; large `OFFSET` scans get slower as users go deeper.
+- Mixing tenant data without tenant-leading indexes in multi-tenant tables.
+- Assuming the planner will pick the intended index when statistics are stale.
+- Fixing one slow query with denormalization but forgetting repair/backfill logic.
 
 ### Denormalization Trade-Off
 
@@ -660,6 +955,12 @@ AWS DynamoDB documentation describes adaptive capacity as a mechanism that helps
 > **Challenge 3: Dynamo Conflict During Partition**  
 > Two replicas accept different cart updates during a network partition. Explain sloppy quorum, hinted handoff, vector clocks, and semantic reconciliation.
 
+> **Challenge 4: Cross-Shard Join Performance**  
+> A SaaS analytics page joins `users`, `projects`, `events`, and `invoices`. After sharding by `tenant_id`, small tenants are fast, but enterprise tenants time out. Explain what happened and redesign the query path.
+
+> **Challenge 5: Choosing A Shard Key For Multi-Tenant SaaS**  
+> You are building a project-management SaaS. Tenants range from 3-person startups to 200,000-person enterprises. Most queries are tenant-scoped, but large tenants generate most traffic. Pick a shard key and explain how you handle whales.
+
 <details><summary>Click for Staff-Engineer Level Answers</summary>
 
 ## Challenge 1
@@ -673,6 +974,18 @@ The primary committed the write, but the replica had not replayed the log yet. R
 ## Challenge 3
 
 Sloppy quorum accepts writes on reachable nodes. Hinted handoff later forwards missed writes to intended owners. Vector clocks detect concurrent siblings. The application merges the cart semantically, writes back a merged version, and avoids last-write-wins data loss.
+
+## Challenge 4
+
+The system is still "tenant-local" for small tenants, but enterprise tenants are now too large for one shard or one query plan. Cross-table joins may be local to one shard for small tenants, yet produce huge scans, memory-heavy hash joins, and slow aggregations for large tenants.
+
+Fix by separating OLTP and analytics paths. Keep transactional entities tenant-scoped, but stream events/invoices into an analytical store or precomputed materialized views. For large tenants, split by `tenant_id + hash(project_id)` or time bucket where query patterns allow. Avoid live cross-shard joins on user-facing requests; use async rollups, search/OLAP indexes, and query limits.
+
+## Challenge 5
+
+Start with `tenant_id` because most authorization, billing, and queries are tenant-scoped. Then handle whales explicitly: use composite keys such as `tenant_id + hash(entity_id)` for high-volume tables, dedicated shards for the largest tenants, per-tenant rate limits, and tenant-aware rebalancing.
+
+Do not use only `tenant_id` if one enterprise can dominate a shard. Do not use only random object IDs if every common request needs all objects for one tenant. The mature answer is usually hybrid: tenant locality for normal tenants, sub-sharding or dedicated placement for whale tenants.
 
 </details>
 
