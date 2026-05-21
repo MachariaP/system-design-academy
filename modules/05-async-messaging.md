@@ -74,6 +74,50 @@ Consider a user generating a large financial report.
 | One dependency slows the whole request | Work can retry independently |
 | Scaling web means scaling workers too | Each layer scales separately |
 
+### Visual Lifecycle: `OrderPlaced`
+
+This sequence shows the operational life of a message, including visibility timeout, acknowledgments, failure routing, and replay.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant API as Order API
+    participant Broker as Broker / Queue
+    participant Worker as Payment Worker
+    participant DLQ as Dead Letter Queue
+    participant Ops as Operator / Replay Tool
+
+    Client->>API: POST /orders
+    API->>API: validate request<br/>create order_id
+    API->>Broker: publish OrderPlaced<br/>message_id=uuid
+    Broker-->>API: publisher confirm
+    API-->>Client: 202 Accepted<br/>order_status=pending
+
+    Broker->>Worker: deliver message<br/>visibility timeout starts
+    Worker->>Worker: process payment
+    alt success before visibility timeout
+        Worker->>Broker: ack
+        Broker->>Broker: remove message
+    else transient failure
+        Worker->>Broker: nack requeue=true
+        Broker->>Broker: make message visible again
+        Broker->>Worker: redeliver message<br/>delivery_count += 1
+    else worker crashes or timeout expires
+        Broker->>Broker: visibility timeout expires
+        Broker->>Worker: redeliver message
+    else retries exhausted or permanent failure
+        Worker->>Broker: reject / nack requeue=false
+        Broker->>DLQ: route to DLQ<br/>preserve payload + headers
+        DLQ-->>Ops: alert: DLQ size > 0
+        Ops->>DLQ: inspect and repair payload/code
+        Ops->>Broker: replay fixed OrderPlaced
+        Broker->>Worker: deliver replayed message
+    end
+```
+
+The key rule is simple: a message should be removed only after the business effect is safely committed. If the worker cannot prove that, the broker should redeliver or isolate the message.
+
 ---
 
 ## 3. Message Queues: Point-To-Point
@@ -153,6 +197,23 @@ The event is broadcast. Each subscriber owns its own processing.
 
 ## 5. Queue vs. Pub/Sub Comparison
 
+### Decision Matrix
+
+| Requirement | Prefer Queue | Prefer Pub/Sub / Stream |
+|---|---|---|
+| **One task processed once** | Use a queue such as SQS, RabbitMQ, or Celery so one worker claims one task | Avoid plain broadcast unless each subscriber has its own dedupe and task ownership |
+| **Multiple independent reactions** | Use separate queues only if each reaction is a separate task pipeline | Use SNS fanout, RabbitMQ exchanges, Kafka, or Pulsar so payment, inventory, email, and analytics all receive the same event |
+| **Replayability** | Traditional queues are awkward after ack; replay usually means re-enqueueing from storage or DLQ | Log systems such as Kafka make replay natural by resetting offsets or starting a new consumer group |
+| **Ordering guarantee** | Usually per queue, FIFO queue, or shard; strict ordering limits parallelism | Usually per partition or message group; global ordering is expensive |
+| **Latency** | SQS is managed but often higher latency; RabbitMQ is low-latency for task dispatch | SNS is fast fanout; Kafka is high-throughput and durable but adds batching and commit behavior |
+
+### Tool Examples
+
+| Pair | Queue Shape | Pub/Sub Shape |
+|---|---|---|
+| **SQS vs. SNS** | SQS gives each message to one consumer in a queue; use it for jobs | SNS broadcasts one event to many subscriptions; often SNS fans out into many SQS queues |
+| **RabbitMQ vs. Kafka** | RabbitMQ is excellent for routed work queues, acknowledgments, TTLs, and DLQs | Kafka is a durable ordered log with partitions, offsets, replay, and consumer groups |
+
 | Dimension | Message Queue: Point-to-Point | Pub/Sub: Broadcasting |
 |---|---|---|
 | **Primary purpose** | Distribute tasks among workers | Notify multiple systems of events |
@@ -178,6 +239,114 @@ End-to-end exactly-once behavior requires:
 - Careful handling of retries and crashes.
 
 In most business systems, design for **at-least-once delivery plus idempotent consumers**.
+
+### Kafka Transactions: What "Exactly Once" Really Means
+
+Kafka's exactly-once semantics are strongest when the application consumes from Kafka, writes output back to Kafka, and commits consumed offsets in the same transaction.
+
+Conceptual flow:
+
+```python
+# Pseudocode: Kafka consume-process-produce transaction.
+
+producer.init_transactions()
+
+while True:
+    records = consumer.poll(timeout_ms=1000)
+    if not records:
+        continue
+
+    producer.begin_transaction()
+    try:
+        for record in records:
+            output = transform(record.value)
+            producer.send(
+                "order-projections",
+                key=record.key,
+                value=output,
+            )
+
+        producer.send_offsets_to_transaction(
+            offsets=consumer.current_offsets(),
+            consumer_group_id="order-projector-v1",
+        )
+        producer.commit_transaction()
+    except Exception:
+        producer.abort_transaction()
+        raise
+```
+
+Consumers that set `isolation.level=read_committed` will not read aborted transactional output. This prevents a downstream Kafka consumer from seeing output records when the input offsets were not committed.
+
+Important limits:
+
+- Kafka transactions do not automatically make external databases, payment gateways, email providers, or REST APIs exactly-once.
+- Transactions add coordination cost and require correct producer IDs, fencing, offset handling, and consumer isolation settings.
+- They are most natural for Kafka-to-Kafka pipelines, stream processing, projections, and event enrichment.
+
+### Practical Default: Idempotent Producer + Idempotent Consumer
+
+A more common production design is:
+
+| Layer | Practical Control |
+|---|---|
+| **Producer** | Use stable `message_id`, idempotency key, publisher confirms, and retry with dedupe |
+| **Broker** | Expect at-least-once delivery and possible redelivery |
+| **Consumer** | Store processed message IDs inside the same transaction as the business update |
+| **External side effects** | Pass idempotency keys to providers when supported |
+
+### Idempotent Consumer With A Unique Constraint
+
+Use a unique constraint on `(message_id, consumer_id)` so duplicate deliveries become harmless.
+
+```sql
+CREATE TABLE processed_messages (
+    message_id VARCHAR(128) NOT NULL,
+    consumer_id VARCHAR(128) NOT NULL,
+    processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (message_id, consumer_id)
+);
+```
+
+```python
+from __future__ import annotations
+
+import psycopg
+
+
+CONSUMER_ID = "payment-worker-v1"
+
+
+def handle_order_placed(conn: psycopg.Connection, message: dict) -> None:
+    message_id = message["message_id"]
+    order_id = message["order_id"]
+
+    with conn.transaction():
+        inserted = conn.execute(
+            """
+            INSERT INTO processed_messages (message_id, consumer_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING message_id
+            """,
+            (message_id, CONSUMER_ID),
+        ).fetchone()
+
+        if inserted is None:
+            return
+
+        conn.execute(
+            """
+            UPDATE orders
+            SET payment_status = 'captured'
+            WHERE order_id = %s
+              AND payment_status = 'pending'
+            """,
+            (order_id,),
+        )
+```
+
+The dedupe insert and the business update happen in one transaction. If the worker crashes before commit, the broker can redeliver. If the worker commits but crashes before ack, the duplicate delivery is skipped.
 
 ---
 
@@ -258,6 +427,38 @@ flowchart LR
 
 Queues are buffers, not magic. If producers publish faster than consumers process, the backlog grows.
 
+### Propagation Diagram
+
+```mermaid
+flowchart LR
+    Client["Clients"]
+    API["API Layer<br/>accepts orders"]
+    Producer["Producer<br/>publishes jobs"]
+    Broker["Broker<br/>queue depth rising"]
+    Consumer["Consumers<br/>payment workers"]
+    DB["Downstream DB<br/>latency rising"]
+    Scale["Autoscaler<br/>add workers if DB healthy"]
+    Throttle["Broker / Gateway<br/>producer throttling"]
+    Reject["API returns 429<br/>Retry-After header"]
+
+    Client -->|"checkout requests"| API
+    API --> Producer
+    Producer -->|"publish OrderPlaced"| Broker
+    Broker -->|"deliver jobs"| Consumer
+    Consumer -->|"writes / reads"| DB
+
+    DB -.->|"p99 latency spikes"| Consumer
+    Consumer -.->|"ack rate falls"| Broker
+    Broker -.->|"queue depth + message age rise"| Scale
+    Broker -.->|"memory / depth threshold crossed"| Throttle
+    Throttle -.->|"publish rate limited"| Producer
+    Producer -.->|"cannot enqueue safely"| API
+    API -.->|"shed load"| Reject
+    Reject -.->|"client retries later"| Client
+```
+
+Backpressure is healthiest when it propagates before the broker is full. The API should know when the queue is no longer a safe place to put new work.
+
 ### What Happens When Workers Fall Behind
 
 | Symptom | Meaning |
@@ -282,6 +483,16 @@ Queues are buffers, not magic. If producers publish faster than consumers proces
 | **Autoscaling** | Add workers when backlog and downstream health allow |
 
 Backpressure should protect the whole system, not just the broker.
+
+### Backpressure Escalation Policy
+
+| Trigger | Action | User-Facing Result |
+|---|---|---|
+| DB p99 latency above threshold | Reduce worker concurrency | Existing backlog drains slowly, database recovers |
+| Queue depth rising but DB healthy | Scale workers horizontally | Users see delayed completion, not failed intake |
+| Queue depth and message age both rising | Throttle producers | API accepts fewer new jobs |
+| Broker memory or disk alarm | Stop non-critical producers | Optional workflows pause |
+| Queue is beyond safe limit | Return `429 Too Many Requests` or `503 Service Unavailable` | Clients retry with `Retry-After` |
 
 ---
 
@@ -385,6 +596,8 @@ def connect() -> pika.BlockingConnection:
     )
     params.heartbeat = 30
     params.blocked_connection_timeout = 60
+    params.connection_attempts = 5
+    params.retry_delay = 2
     return pika.BlockingConnection(params)
 
 
@@ -429,8 +642,19 @@ def publish_task(payload: Dict[str, Any]) -> None:
     print(f"published job_id={message_id}")
 
 
+def publish_with_retry(payload: Dict[str, Any], *, max_attempts: int = 5) -> None:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            publish_task(payload)
+            return
+        except pika.exceptions.AMQPError:
+            if attempt == max_attempts:
+                raise
+            time.sleep(min(10, 2 ** attempt))
+
+
 if __name__ == "__main__":
-    publish_task(
+    publish_with_retry(
         {
             "user_id": "user-123",
             "report_type": "monthly_statement",
@@ -486,6 +710,8 @@ def connect() -> pika.BlockingConnection:
     )
     params.heartbeat = 30
     params.blocked_connection_timeout = 60
+    params.connection_attempts = 5
+    params.retry_delay = 2
     return pika.BlockingConnection(params)
 
 
@@ -540,22 +766,30 @@ def on_message(channel, method, properties, body: bytes) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    connection = connect()
-    channel = connection.channel()
-    declare_topology(channel)
+    while True:
+        connection = None
+        try:
+            connection = connect()
+            channel = connection.channel()
+            declare_topology(channel)
 
-    # Fair dispatch: do not send a worker more than one unacked job at a time.
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(queue=QUEUE_NAME, on_message_callback=on_message)
+            # Fair dispatch: do not send a worker more than one unacked job at a time.
+            channel.basic_qos(prefetch_count=1)
+            channel.basic_consume(queue=QUEUE_NAME, on_message_callback=on_message)
 
-    LOGGER.info("worker waiting for tasks")
-    try:
-        channel.start_consuming()
-    except KeyboardInterrupt:
-        LOGGER.info("shutdown requested")
-        channel.stop_consuming()
-    finally:
-        connection.close()
+            LOGGER.info("worker waiting for tasks")
+            channel.start_consuming()
+        except KeyboardInterrupt:
+            LOGGER.info("shutdown requested")
+            if connection and connection.is_open:
+                connection.close()
+            break
+        except pika.exceptions.AMQPError:
+            LOGGER.exception("RabbitMQ connection failed; reconnecting soon")
+            time.sleep(5)
+        finally:
+            if connection and connection.is_open:
+                connection.close()
 
 
 if __name__ == "__main__":
@@ -572,6 +806,80 @@ if __name__ == "__main__":
 | Worker nacks with requeue | Message becomes available again |
 
 Acknowledgments do not prevent duplicate processing. They prevent silent loss.
+
+### Publisher Confirms, Heartbeats, And Recovery
+
+| Mechanism | Why It Matters |
+|---|---|
+| **Publisher confirms** | The producer waits for broker acceptance before treating the publish as successful. If confirm fails, retry with the same `message_id` so consumers can dedupe. |
+| **Heartbeat** | The broker and client detect dead TCP connections instead of waiting forever. |
+| **Connection retry** | Producers and workers survive broker restarts, rolling deploys, and short network interruptions. |
+| **`blocked_connection_timeout`** | Prevents a producer from hanging forever when RabbitMQ blocks publishers due to memory or disk alarms. |
+
+### Per-Queue Dead Letter Exchange
+
+RabbitMQ dead-lettering is configured on the source queue, not on the consumer. The worker declares:
+
+```python
+arguments={
+    "x-dead-letter-exchange": "report.dlx",
+    "x-dead-letter-routing-key": "report.failed",
+}
+```
+
+Any message rejected with `requeue=False`, expired by TTL, or dropped due to queue limits can then be routed to the DLX and into the DLQ.
+
+### Docker Compose: RabbitMQ + Producer + Worker
+
+```yaml
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    command: >
+      sh -c "pip install pika &&
+             python worker.py"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  producer:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    command: >
+      sh -c "pip install pika &&
+             python producer.py"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+```
+
+Run the stack from a directory containing `producer.py`, `worker.py`, and `docker-compose.yml`:
+
+```bash
+docker compose up --build
+```
 
 ---
 
@@ -598,6 +906,43 @@ Messages should go to a DLQ when:
 | Alert on DLQ growth | DLQ is a production signal, not a trash bin |
 | Build replay tooling | Operators need safe repair paths |
 | Separate temporary and permanent failures | Avoid retrying messages that can never succeed |
+
+### DLQ Workflow State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> InQueue
+    InQueue --> Processing: worker receives message\nalert if message_age p99 high
+    Processing --> [*]: success ack\nalert if ack_rate drops
+    Processing --> RetryQueue: temporary failure\nalert if retry_rate spikes
+    Processing --> DLQ: permanent failure\nalert immediately
+    RetryQueue --> Processing: delay elapsed\nredelivery_count += 1
+    RetryQueue --> DLQ: retries exhausted\nalert if exhausted_count > threshold
+    DLQ --> ManualRepair: operator triage\nalert if DLQ age > SLA
+    ManualRepair --> Replay: payload fixed or code deployed
+    Replay --> Processing: re-enqueue with same message_id\nor new replay_id
+```
+
+### Alert Triggers
+
+| Stage | Alert Trigger | Likely Meaning |
+|---|---|---|
+| **InQueue** | Queue depth or p99 message age exceeds SLA | Consumers are slow or producers are too fast |
+| **Processing** | Ack rate falls while delivery rate stays high | Workers are stuck, crashing, or blocked downstream |
+| **RetryQueue** | Retry rate jumps | Dependency instability or a bad deploy |
+| **DLQ** | DLQ size greater than zero for critical workflows | Poison message, schema mismatch, or permanent downstream rejection |
+| **Manual repair** | Oldest DLQ message exceeds repair SLA | Operational backlog needs escalation |
+| **Replay** | Replayed messages fail again | Fix is incomplete or replay is unsafe |
+
+### Replay Rules
+
+| Rule | Reason |
+|---|---|
+| Replay into the normal queue only after the bug or data issue is fixed | Otherwise the DLQ loops forever |
+| Preserve original `message_id` when consumers use dedupe | Prevents duplicate business effects |
+| Add `replay_id` and `replayed_by` metadata | Gives operators an audit trail |
+| Replay in batches with rate limits | Avoids overwhelming recovered dependencies |
+| Watch DLQ and normal queue metrics during replay | Confirms that repair is working |
 
 ---
 
@@ -684,6 +1029,18 @@ Imagine an e-commerce order engine at midnight on Black Friday.
 
 Traffic increases by 10,000 percent. Users can browse, add items to cart, and attempt checkout. The payment provider slows down.
 
+### Case Study: Checkout Surge
+
+At 00:00:00, the sale opens. The checkout API normally handles 2,000 orders per minute with 10 payment workers. Each worker processes about 20 payment jobs per second when the payment provider is healthy.
+
+At 00:00:30:
+
+- Queue depth jumps from 0 to 10,000,000 messages.
+- The oldest message age climbs from 0 seconds to 4 minutes.
+- Payment provider p99 latency rises from 250 ms to 8 seconds.
+- Worker ack rate falls while redelivery count climbs.
+- A new payment webhook schema breaks 3 percent of jobs, sending them to the DLQ.
+
 ### Architecture Walkthrough
 
 | Stage | Design Choice | Protection |
@@ -699,6 +1056,28 @@ Traffic increases by 10,000 percent. Users can browse, add items to cart, and at
 | 9 | Retries use backoff and jitter | Recovering provider is not hammered |
 | 10 | Failed poison jobs go to DLQ | Bad messages do not block the queue |
 
+### Operational Response
+
+| Time | Signal | Action |
+|---|---|---|
+| 00:00:10 | Queue depth crosses 1M | Autoscaler starts adding payment workers |
+| 00:00:45 | Workers scale from 10 to 150 | Throughput rises, but provider latency remains high |
+| 00:01:30 | DB p99 remains healthy, provider p99 improves | Autoscaler continues to 500 workers |
+| 00:03:00 | DLQ grows to 300,000 messages | On-call disables the broken webhook subscriber and pages payments team |
+| 00:08:00 | Queue depth stops rising | API removes emergency `429` for paid users, keeps rate limits for anonymous traffic |
+| 00:20:00 | Bug fixed and deployed | Operators replay DLQ in 10,000-message batches |
+
+### Why The System Survived
+
+| Design Choice | Effect During The Incident |
+|---|---|
+| Orders were written before publishing | Customer intent was not lost even when payment lagged |
+| Broker was durable and monitored | The team could see backlog size, age, and failure pattern |
+| Workers were stateless | Scaling from 10 to 500 was operationally simple |
+| Worker concurrency was capped per instance | The database did not collapse while the worker fleet grew |
+| DLQ separated poison messages | Broken webhook payloads did not block valid payment jobs |
+| Replay tooling existed before the sale | The team repaired and replayed bad messages without ad hoc scripts |
+
 ### Core Lesson
 
 The queue is not just a buffer. It is a **failure boundary**.
@@ -707,7 +1086,30 @@ It lets browsing, carts, checkout intake, payment processing, email, analytics, 
 
 ---
 
-## 14. Interview Checklist
+## 14. Monitoring Checklist
+
+Every async system needs metrics that show backlog, freshness, throughput, failure, and replay safety.
+
+| Metric | What It Tells You | Alert Example |
+|---|---|---|
+| **Queue depth** | How many messages are waiting | Depth above normal baseline for 5 minutes |
+| **Message age p99** | User-visible delay for queued work | p99 age greater than workflow SLA |
+| **Redelivery count** | Duplicate deliveries and crash/timeout behavior | Redelivery rate suddenly doubles |
+| **DLQ size** | Poison or exhausted messages | DLQ size > 0 for payments, orders, or security workflows |
+| **Consumer lag** | How far a stream consumer is behind the head of the log | Lag grows while producers are steady |
+| **Ack rate** | Successful processing throughput | Ack rate drops below expected capacity |
+| **Nack rate** | Explicit processing failures | Nack rate spikes after deploy |
+| **Retry queue depth** | Delayed transient failures | Retry depth grows faster than it drains |
+| **Oldest DLQ message age** | Repair SLA health | Oldest DLQ message older than 30 minutes |
+| **Worker concurrency** | Active processing pressure | Concurrency pinned at max while ack rate is low |
+| **Downstream p99 latency** | Whether workers are blocked on dependencies | DB or provider p99 above backpressure threshold |
+| **Producer publish failures** | Broker availability or throttling | Confirm failures or blocked publishes exceed threshold |
+
+Dashboards should show queue depth and message age together. A deep queue with young messages may be a manageable burst; a moderate queue with old messages means users are waiting too long.
+
+---
+
+## 15. Interview Checklist
 
 When designing an async system, ask:
 
@@ -769,5 +1171,73 @@ Queues are best for distributing work where one task should be handled by one wo
 Pub/sub is best when one event should notify many systems. It is natural for event-driven architecture, analytics, projections, and audit pipelines.
 
 Queues simplify task ownership. Pub/sub improves decoupling and fanout, but subscribers must each manage their own replay, idempotency, and failure behavior.
+
+</details>
+
+<details>
+<summary>Design a system that runs millions of cron jobs per day, each may take from 1 second to 1 hour, with at-most-once or at-least-once guarantees.</summary>
+
+Start with requirements:
+
+- Millions of scheduled executions per day.
+- Jobs vary from 1 second to 1 hour.
+- Tenants may need isolation and rate limits.
+- Some jobs are at-most-once, where skipping is better than duplicate execution.
+- Some jobs are at-least-once, where retry is required and handlers must be idempotent.
+
+High-level design:
+
+```mermaid
+flowchart LR
+    API["Schedule API"]
+    Store["Schedule Store<br/>job_id, cron, next_run_at"]
+    Shards["Scheduler Shards<br/>claim due jobs"]
+    Queue["Execution Queue"]
+    Workers["Worker Fleet"]
+    Lease["Lease Store<br/>run_id, expires_at"]
+    Results["Run History<br/>status, duration, error"]
+    DLQ["DLQ / Repair Queue"]
+
+    API --> Store
+    Shards -->|"scan by next_run_at"| Store
+    Shards -->|"enqueue run_id"| Queue
+    Queue --> Workers
+    Workers --> Lease
+    Workers --> Results
+    Workers --> DLQ
+    Workers -->|"compute next_run_at"| Store
+```
+
+Key components:
+
+| Component | Responsibility |
+|---|---|
+| **Schedule store** | Durable source of truth for cron expression, timezone, owner, enabled flag, and next run time |
+| **Scheduler shards** | Claim due schedules by shard key and enqueue execution messages |
+| **Execution queue** | Buffer runnable jobs and absorb bursts at minute boundaries |
+| **Lease store** | Prevent two workers from executing the same run concurrently |
+| **Worker fleet** | Executes jobs with per-tenant concurrency and runtime limits |
+| **Run history** | Stores status, timestamps, attempts, error, and output pointer |
+| **DLQ** | Isolates invalid jobs, exhausted retries, and poison payloads |
+
+Guarantee choices:
+
+| Guarantee | Implementation | Trade-Off |
+|---|---|---|
+| **At-most-once** | Mark run as `started` before execution; do not retry after worker crash | May skip jobs during crashes |
+| **At-least-once** | Enqueue run with lease; retry when lease expires or worker nacks | May run duplicates, so job handler needs idempotency |
+
+Important details:
+
+- Use `job_id` plus scheduled fire time to create a stable `run_id`.
+- Partition schedules by `hash(job_id)` so scheduler shards do not fight over the whole table.
+- Claim due schedules with a transactional compare-and-set on `next_run_at` or a lease.
+- Use priority queues or separate queues for short, long, and tenant-isolated work.
+- Do not let one-hour jobs occupy all workers; use separate pools or runtime classes.
+- Track p99 scheduling delay: `actual_start_time - scheduled_time`.
+- Put exhausted or invalid executions into a DLQ with enough context to repair and replay.
+- For at-least-once jobs, require idempotency keys or a processed-run table in the target system.
+
+The core interview answer is that the scheduler decides *when* work should run, but the queue and worker system decides *how fast* work can safely run.
 
 </details>
