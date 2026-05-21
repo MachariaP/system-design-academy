@@ -118,6 +118,37 @@ sequenceDiagram
 
 The key rule is simple: a message should be removed only after the business effect is safely committed. If the worker cannot prove that, the broker should redeliver or isolate the message.
 
+### Message State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Published: producer publish
+    Published --> InQueue: broker persists message
+    InQueue --> InFlight: consumer receives\nvisibility timeout starts
+
+    InFlight --> Acked: consumer commits work\nand sends ack
+    Acked --> [*]: broker removes message
+
+    InFlight --> Nacked: consumer rejects\ntransient failure
+    Nacked --> RetryDelay: retry policy applies\nbackoff + jitter
+    RetryDelay --> InQueue: delay elapsed\nredelivery_count += 1
+
+    InFlight --> TimedOut: worker crash or\nvisibility timeout expires
+    TimedOut --> InQueue: broker redelivers
+
+    InFlight --> DLQ: permanent failure\nor retries exhausted
+    RetryDelay --> DLQ: max attempts exceeded
+    DLQ --> Replayed: manual repair\nor bulk replay
+    Replayed --> InQueue: re-enqueue with replay metadata
+
+    note right of InFlight
+      Message is hidden from other consumers.
+      If the worker dies, timeout causes redelivery.
+    end note
+```
+
+Operationally, `acked` means the broker can forget the message. It does not prove the external world changed exactly once; that is the consumer's idempotency job.
+
 ---
 
 ## 3. Message Queues: Point-To-Point
@@ -244,6 +275,30 @@ In most business systems, design for **at-least-once delivery plus idempotent co
 
 Kafka's exactly-once semantics are strongest when the application consumes from Kafka, writes output back to Kafka, and commits consumed offsets in the same transaction.
 
+```mermaid
+flowchart LR
+    Input["Input Topic<br/>orders"]
+    Consumer["Consumer<br/>poll records"]
+    Txn["Transactional Producer<br/>beginTransaction"]
+    Output["Output Topic<br/>order-projections"]
+    Offsets["Consumer Offsets<br/>sendOffsetsToTransaction"]
+    Commit["commitTransaction"]
+    ReadCommitted["Downstream Consumers<br/>isolation.level=read_committed"]
+    Abort["abortTransaction<br/>on failure"]
+
+    Input --> Consumer
+    Consumer --> Txn
+    Txn -->|"produce transformed records"| Output
+    Txn -->|"bind consumed offsets"| Offsets
+    Output --> Commit
+    Offsets --> Commit
+    Commit --> ReadCommitted
+    Txn -. "exception" .-> Abort
+
+    style Commit fill:#ecfdf5,stroke:#059669
+    style Abort fill:#fee2e2,stroke:#dc2626
+```
+
 Conceptual flow:
 
 ```python
@@ -347,6 +402,18 @@ def handle_order_placed(conn: psycopg.Connection, message: dict) -> None:
 ```
 
 The dedupe insert and the business update happen in one transaction. If the worker crashes before commit, the broker can redeliver. If the worker commits but crashes before ack, the duplicate delivery is skipped.
+
+### Choosing An Idempotency Strategy
+
+| Strategy | Use When | Strength | Watch Out For |
+|---|---|---|---|
+| **Idempotency keys stored in DB** | Client retries the same business request, such as `POST /payments` | Returns the same response for duplicate requests | Must reject same key with different payload hash |
+| **Processed-message table** | Worker consumes at-least-once messages from a broker | Generic dedupe per `(message_id, consumer_id)` | Table can grow quickly; needs retention/partitioning |
+| **Unique business constraints** | Duplicate side effect maps to a natural key, such as one invoice per `order_id` | Simple and enforced by the database | Only works when a natural uniqueness rule exists |
+| **External idempotency provider** | Payment gateway, email provider, webhook target supports idempotency keys | Protects side effects outside your database | Provider key TTL and semantics may differ from yours |
+| **State-machine transitions** | Entity has legal transitions, such as `pending -> paid` | Duplicate messages become no-op transitions | Must handle out-of-order events explicitly |
+
+The most robust consumers often combine strategies: processed-message table for broker delivery, unique constraints for business invariants, and provider idempotency keys for external side effects.
 
 ---
 
@@ -458,6 +525,28 @@ flowchart LR
 ```
 
 Backpressure is healthiest when it propagates before the broker is full. The API should know when the queue is no longer a safe place to put new work.
+
+### Pressure Points: Slow Database To API 429
+
+```mermaid
+flowchart TD
+    DBSlow["1. Database slows<br/>p99 40ms -> 2s"]
+    WorkerBlocked["2. Workers block on DB<br/>in-flight messages rise"]
+    AckDrops["3. Ack rate drops<br/>nack/timeout rate rises"]
+    QueueGrows["4. Queue depth grows<br/>message age p99 rises"]
+    BrokerPressure["5. Broker pressure<br/>memory/disk alarms or consumer lag"]
+    ProducerThrottle["6. Producers throttled<br/>publish confirms slow/fail"]
+    APIShed["7. API sheds load<br/>429 Retry-After"]
+    Recover["8. Recovery<br/>drain backlog under DB-safe concurrency"]
+
+    DBSlow --> WorkerBlocked --> AckDrops --> QueueGrows --> BrokerPressure --> ProducerThrottle --> APIShed --> Recover
+
+    style DBSlow fill:#fee2e2,stroke:#dc2626
+    style QueueGrows fill:#fef3c7,stroke:#d97706
+    style APIShed fill:#e8f4ff,stroke:#2563eb
+```
+
+If autoscaling workers makes the database slower, scale *down* or cap concurrency. More consumers are not always more throughput.
 
 ### What Happens When Workers Fall Behind
 
@@ -912,15 +1001,24 @@ Messages should go to a DLQ when:
 ```mermaid
 stateDiagram-v2
     [*] --> InQueue
-    InQueue --> Processing: worker receives message\nalert if message_age p99 high
-    Processing --> [*]: success ack\nalert if ack_rate drops
-    Processing --> RetryQueue: temporary failure\nalert if retry_rate spikes
-    Processing --> DLQ: permanent failure\nalert immediately
+    InQueue --> Processing: worker receives message\nalert: message_age p99 > SLA
+    Processing --> Acked: success ack\nalert: ack_rate drops
+    Acked --> [*]
+    Processing --> RetryQueue: temporary failure\nalert: retry_rate spike
+    Processing --> DLQ: permanent failure\nalert: critical DLQ > 0
     RetryQueue --> Processing: delay elapsed\nredelivery_count += 1
-    RetryQueue --> DLQ: retries exhausted\nalert if exhausted_count > threshold
-    DLQ --> ManualRepair: operator triage\nalert if DLQ age > SLA
-    ManualRepair --> Replay: payload fixed or code deployed
-    Replay --> Processing: re-enqueue with same message_id\nor new replay_id
+    RetryQueue --> DLQ: retries exhausted\nalert: exhausted_count > threshold
+    DLQ --> Triage: operator inspects payload\nalert: oldest DLQ age > SLA
+    Triage --> ManualRepair: fix data, schema, or code
+    ManualRepair --> ReplayReady: approve replay batch\nalert: replay requires owner approval
+    ReplayReady --> Replay: rate-limited replay
+    Replay --> Processing: re-enqueue with same message_id\nor replay_id metadata
+    Replay --> DLQ: replay fails again\nalert: replay_failure_rate > 0
+
+    note right of DLQ
+      DLQ is a production signal.
+      It is not long-term storage.
+    end note
 ```
 
 ### Alert Triggers
@@ -949,6 +1047,70 @@ stateDiagram-v2
 ## 12. Exponential Backoff And Retry Wrapper
 
 Retries should be bounded, delayed, and jittered.
+
+### What If...? All Workers Retry At The Same Time
+
+> ⚠️ **Failure mode**  
+> A payment provider has a 90-second outage. Every worker fails, sleeps for exactly 60 seconds, then retries together. The provider begins recovering, but the synchronized retry wave knocks it over again.
+
+```mermaid
+sequenceDiagram
+    participant W as 10,000 Workers
+    participant P as Payment Provider
+    participant Q as Retry Queue
+
+    W->>P: payment calls
+    P--xW: timeout / 503
+    W->>Q: retry in exactly 60s
+    Note over W,Q: all jobs share same retry delay
+    Q-->>W: redeliver all jobs at T+60s
+    W->>P: synchronized retry wave
+    P--xW: provider overloads again
+    W->>Q: retry in exactly 60s again
+```
+
+Solution:
+
+| Control | Effect |
+|---|---|
+| **Exponential backoff** | Retries slow down as failures continue |
+| **Full jitter** | Workers spread across a time window instead of synchronizing |
+| **Retry budget** | Limits total retry traffic as a fraction of normal traffic |
+| **Circuit breaker** | Stops calling a dependency that is known unhealthy |
+| **Delayed retry queue** | Frees worker slots during long backoff periods |
+
+```python
+from __future__ import annotations
+
+import random
+import time
+from collections.abc import Callable
+from typing import TypeVar
+
+
+T = TypeVar("T")
+
+
+def call_with_retry_budget(
+    operation: Callable[[], T],
+    *,
+    max_attempts: int = 5,
+    base_delay_seconds: float = 0.25,
+    max_delay_seconds: float = 30.0,
+) -> T:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except TimeoutError:
+            if attempt == max_attempts:
+                raise
+
+            cap = min(max_delay_seconds, base_delay_seconds * (2 ** (attempt - 1)))
+            # Full jitter: random delay between 0 and cap.
+            time.sleep(random.uniform(0, cap))
+
+    raise RuntimeError("unreachable")
+```
 
 ```python
 """
@@ -1067,6 +1229,31 @@ At 00:00:30:
 | 00:08:00 | Queue depth stops rising | API removes emergency `429` for paid users, keeps rate limits for anonymous traffic |
 | 00:20:00 | Bug fixed and deployed | Operators replay DLQ in 10,000-message batches |
 
+### Incident Timeline With Metrics
+
+| Time | Queue Depth | Worker Count | DB p99 Latency | DLQ Size | Decision |
+|---|---:|---:|---:|---:|---|
+| 00:00:00 | 0 | 10 | 35 ms | 0 | Sale opens; normal checkout flow |
+| 00:00:10 | 1M | 50 | 55 ms | 0 | Autoscaler starts; DB still healthy |
+| 00:00:30 | 10M | 150 | 90 ms | 40k | Throttle low-priority producers; webhook errors appear |
+| 00:01:00 | 12M | 300 | 180 ms | 120k | Cap per-worker DB concurrency to protect orders DB |
+| 00:03:00 | 9M | 500 | 220 ms | 300k | Disable broken payment webhook consumer; page owner |
+| 00:05:00 | 6M | 500 | 140 ms | 300k | Keep API 429 for anonymous checkout retries |
+| 00:08:00 | 3M | 420 | 80 ms | 300k | Queue depth drains; relax paid-user throttles |
+| 00:12:00 | 800k | 250 | 50 ms | 300k | Scale down gradually; avoid oscillation |
+| 00:20:00 | 50k | 80 | 40 ms | 0 after replay | Replay repaired DLQ in 10k-message batches |
+
+### Action Decision Table
+
+| Minute | Action Taken | Why | Guardrail |
+|---:|---|---|---|
+| 0 | Accept orders as pending | Preserve customer intent | Orders DB write must succeed before publish |
+| 1 | Scale workers up | DB healthy and queue depth rising | Stop scaling if DB p99 crosses threshold |
+| 3 | Disable broken webhook consumer | DLQ growth caused by schema bug | Do not disable core payment capture |
+| 5 | Keep selective 429s | Prevent queue from growing faster than drain rate | Include `Retry-After` and preserve carts |
+| 8 | Relax throttles for trusted users | Backlog is draining | Watch message age and DB p99 |
+| 20 | Replay DLQ slowly | Bug fixed and payloads repairable | Batch size and replay failure alert |
+
 ### Why The System Survived
 
 | Design Choice | Effect During The Incident |
@@ -1090,20 +1277,20 @@ It lets browsing, carts, checkout intake, payment processing, email, analytics, 
 
 Every async system needs metrics that show backlog, freshness, throughput, failure, and replay safety.
 
-| Metric | What It Tells You | Alert Example |
-|---|---|---|
-| **Queue depth** | How many messages are waiting | Depth above normal baseline for 5 minutes |
-| **Message age p99** | User-visible delay for queued work | p99 age greater than workflow SLA |
-| **Redelivery count** | Duplicate deliveries and crash/timeout behavior | Redelivery rate suddenly doubles |
-| **DLQ size** | Poison or exhausted messages | DLQ size > 0 for payments, orders, or security workflows |
-| **Consumer lag** | How far a stream consumer is behind the head of the log | Lag grows while producers are steady |
-| **Ack rate** | Successful processing throughput | Ack rate drops below expected capacity |
-| **Nack rate** | Explicit processing failures | Nack rate spikes after deploy |
-| **Retry queue depth** | Delayed transient failures | Retry depth grows faster than it drains |
-| **Oldest DLQ message age** | Repair SLA health | Oldest DLQ message older than 30 minutes |
-| **Worker concurrency** | Active processing pressure | Concurrency pinned at max while ack rate is low |
-| **Downstream p99 latency** | Whether workers are blocked on dependencies | DB or provider p99 above backpressure threshold |
-| **Producer publish failures** | Broker availability or throttling | Confirm failures or blocked publishes exceed threshold |
+| Metric | What It Tells You | Alert Threshold Example | Remediation Action |
+|---|---|---|---|
+| **Queue depth** | How many messages are waiting | Depth above normal baseline for 5 minutes | Scale consumers if downstream healthy; throttle producers if not |
+| **Message age p99** | User-visible delay for queued work | p99 age greater than workflow SLA | Prioritize old messages, add capacity, or shed intake |
+| **Redelivery count** | Duplicate deliveries and crash/timeout behavior | Redelivery rate suddenly doubles | Inspect worker crashes, visibility timeout, and idempotency |
+| **DLQ size** | Poison or exhausted messages | DLQ size > 0 for payments, orders, or security workflows | Page owner, pause bad consumer, begin triage |
+| **Consumer lag** | How far a stream consumer is behind the head of the log | Lag grows while producers are steady | Add partitions/consumers or fix slow processing |
+| **Ack rate** | Successful processing throughput | Ack rate drops below expected capacity | Check worker health, downstream latency, and deploys |
+| **Nack rate** | Explicit processing failures | Nack rate spikes after deploy | Roll back, route to DLQ, or disable bad subscriber |
+| **Retry queue depth** | Delayed transient failures | Retry depth grows faster than it drains | Increase jitter/backoff, open circuit, reduce retry budget |
+| **Oldest DLQ message age** | Repair SLA health | Oldest DLQ message older than 30 minutes | Escalate manual repair and replay ownership |
+| **Worker concurrency** | Active processing pressure | Concurrency pinned at max while ack rate is low | Lower concurrency if downstream saturated; add workers only if safe |
+| **Downstream p99 latency** | Whether workers are blocked on dependencies | DB or provider p99 above backpressure threshold | Open circuit, cap concurrency, throttle producers |
+| **Producer publish failures** | Broker availability or throttling | Confirm failures or blocked publishes exceed threshold | Return 429/503, fail non-critical workflows, inspect broker alarms |
 
 Dashboards should show queue depth and message age together. A deep queue with young messages may be a manageable burst; a moderate queue with old messages means users are waiting too long.
 
@@ -1184,6 +1371,7 @@ Start with requirements:
 - Tenants may need isolation and rate limits.
 - Some jobs are at-most-once, where skipping is better than duplicate execution.
 - Some jobs are at-least-once, where retry is required and handlers must be idempotent.
+- Schedules may use customer time zones and must handle daylight saving changes.
 
 High-level design:
 
@@ -1237,7 +1425,26 @@ Important details:
 - Track p99 scheduling delay: `actual_start_time - scheduled_time`.
 - Put exhausted or invalid executions into a DLQ with enough context to repair and replay.
 - For at-least-once jobs, require idempotency keys or a processed-run table in the target system.
+- Store both the cron expression and the schedule timezone, such as `America/New_York`.
+- Compute `next_run_at` using a timezone-aware library, not fixed UTC offsets.
+- Define DST behavior explicitly: skip nonexistent local times, run once for repeated local times, or let the customer choose.
 
 The core interview answer is that the scheduler decides *when* work should run, but the queue and worker system decides *how fast* work can safely run.
+
+### Full Rubric
+
+| Area | Acceptable Answer | Excellent Answer |
+|---|---|---|
+| **API** | Create/update/delete cron jobs with enabled flag | Adds idempotent schedule changes, pause/resume, dry-run next fire times, tenant quotas |
+| **Schedule storage** | Stores cron expression and `next_run_at` | Stores timezone, version, owner, misfire policy, runtime class, and audit history |
+| **Sharding** | Scheduler workers scan due jobs | Shards by stable key, uses leases/compare-and-set, avoids one global due-job scan |
+| **Time zones and DST** | Mentions timezone handling | Defines DST policy for nonexistent/repeated times and uses timezone database rules |
+| **Dispatch** | Enqueues due jobs to a queue | Uses stable `run_id`, priority/runtime queues, per-tenant rate limits, and delayed retries |
+| **At-most-once** | Marks job started before running | Explains crash can skip execution and why that may be acceptable for some jobs |
+| **At-least-once** | Retries failed jobs | Uses leases, visibility timeout, idempotent handlers, processed-run table, bounded retries |
+| **Long jobs** | Supports jobs up to 1 hour | Separates worker pools, renews leases, heartbeats running jobs, and detects stuck workers |
+| **Observability** | Tracks success/failure counts | Adds scheduling delay p99, due backlog, lease expirations, tenant saturation, DLQ age |
+| **Failure handling** | Retries and DLQ | Handles scheduler leader failure, duplicate enqueue, queue outage, worker crash, and replay |
+| **Backpressure** | Adds more workers | Caps per-tenant concurrency, protects downstreams, and returns admission errors for unsafe load |
 
 </details>
