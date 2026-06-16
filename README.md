@@ -15,8 +15,9 @@ System Design Academy is a professional, open-source curriculum for engineers wh
 
 | Quick Overview | Details |
 |---|---|
-| **Modules** | 5 deep-dive modules |
-| **Blueprints** | 3 core blueprints, soon 4 with Live Comments |
+| **Modules** | 14 deep-dive modules |
+| **Blueprints** | 4 core blueprints |
+| **Beginner Docs** | 14 companion guides with plain-language explanations |
 | **Languages used** | Python, TypeScript |
 | **Paper references** | Dynamo, GFS, Facebook Memcached |
 | **Primary audience** | Backend engineers preparing for senior system design interviews |
@@ -48,7 +49,21 @@ System Design Academy is a professional, open-source curriculum for engineers wh
 | 03 | [Caching Strategies & Memory Management](modules/03-caching-memory.md) | Cache-aside, write-through, write-behind, LRU internals, Facebook Memcached patterns, leases, and cache crisis handling |
 | 04 | [Distributed Systems & Communication](modules/04-distributed-comm.md) | TCP/UDP, REST vs gRPC vs WebSockets, consensus, Raft leader election, circuit breakers, retries, and jitter |
 | 05 | [Asynchronous Processing & Message Queues](modules/05-async-messaging.md) | Message queues, pub/sub, Kafka partitions, RabbitMQ task queues, acknowledgments, backpressure, retries, and DLQs |
-| 06 | [Real-World System Design Blueprints](blueprints/system-designs.md) | Interview-ready designs for a URL shortener, web crawler, Twitter/X timeline engine, and an evolving Live Comments system |
+| 06 | [Service Discovery & Service Mesh](modules/06-service-mesh.md) | Client-side vs server-side discovery, sidecar proxies, control plane vs data plane, mTLS, traffic splitting, and circuit breaking |
+| 07 | [Observability & Telemetry](modules/07-observability.md) | Metrics, logs, and traces — the three pillars; SLI/SLO/error budgets, structured logging, OpenTelemetry, and push vs pull architectures |
+| 08 | [Authentication & Authorization](modules/08-security-auth.md) | Stateless JWT vs stateful sessions, OAuth 2.0 & OIDC flows, PKCE, mTLS for service-to-service security, and API gateway patterns |
+| 09 | [Microservices Patterns](modules/09-microservices-patterns.md) | Saga pattern (choreography vs orchestration), transactional outbox, CQRS, event sourcing, and compensating transactions |
+| 10 | [File, Object & Block Storage](modules/10-storage-systems.md) | Storage typologies compared, erasure coding, consistent hashing for object storage, bit-rot detection, and S3 internals |
+| 11 | [Stream Processing & Real-Time Analytics](modules/11-stream-processing.md) | Log-centric architecture, event time vs processing time, watermarks, Lambda vs Kappa, Kafka Streams, Flink, and windowing |
+| 12 | [Distributed Transactions & Consensus](modules/12-distributed-consensus.md) | 2PC, 3PC, Raft leader election, Dynamo-style leaderless consensus, vector clocks, split-brain prevention, and BFT |
+| 13 | [Back-of-the-Envelope Estimation](modules/13-capacity-planning.md) | Latency numbers, power-of-two rules, QPS/storage/bandwidth estimation, peak multipliers, and worked exercises |
+| 14 | [System Design Interview Framework](modules/14-interview-framework.md) | 4-phase whiteboard roadmap, seniority signaling, defensive whiteboarding, mock interview walkthroughs, and a 10-problem question bank |
+
+Each module has a companion **beginner-friendly guide** in the [`Docs/`](Docs/) directory that explains the same concepts using plain language, everyday analogies, and a full glossary — perfect for warming up before the deep dive. Read the beginner guide first, then the advanced module for production-grade depth.
+
+### Real-World System Design Blueprints
+
+Apply everything you learn in [`blueprints/system-designs.md`](blueprints/system-designs.md) — complete interview-ready designs for a **URL shortener**, **web crawler**, **Twitter/X timeline engine**, and **Live Comments system** with WebSocket fanout.
 
 ### Recommended Learning Path
 
@@ -116,15 +131,24 @@ git clone https://github.com/MachariaP/system-design-academy.git
 cd system-design-academy
 ```
 
-Read the modules in order:
+Recommended reading flow — start with a beginner guide, then the advanced module:
 
 ```text
-modules/01-traffic-routing.md
-modules/02-database-scaling.md
-modules/03-caching-memory.md
-modules/04-distributed-comm.md
-modules/05-async-messaging.md
-blueprints/system-designs.md
+Docs/01-traffic-routing.md          →  modules/01-traffic-routing.md
+Docs/02-database-scaling.md         →  modules/02-database-scaling.md
+Docs/03-caching-memory.md           →  modules/03-caching-memory.md
+Docs/04-distributed-comm.md         →  modules/04-distributed-comm.md
+Docs/05-async-messaging.md          →  modules/05-async-messaging.md
+Docs/06-service-mesh.md             →  modules/06-service-mesh.md
+Docs/07-observability.md            →  modules/07-observability.md
+Docs/08-security-auth.md            →  modules/08-security-auth.md
+Docs/09-microservices-patterns.md   →  modules/09-microservices-patterns.md
+Docs/10-storage-systems.md          →  modules/10-storage-systems.md
+Docs/11-stream-processing.md        →  modules/11-stream-processing.md
+Docs/12-distributed-consensus.md    →  modules/12-distributed-consensus.md
+Docs/13-capacity-planning.md        →  modules/13-capacity-planning.md
+Docs/14-interview-framework.md      →  modules/14-interview-framework.md
+blueprints/system-designs.md        (apply everything)
 ```
 
 Recommended study loop:
@@ -178,11 +202,15 @@ Each module’s code blocks are designed to be standalone and can be copied dire
 
 > **📘 Study plan**
 >
-> **Week 1:** Study Modules 01-03: Traffic Routing, Database Scaling, and Caching. Re-draw every Mermaid diagram from memory and explain the bottleneck each diagram is protecting.
+> **Week 1:** Study beginner guides + modules 01-03: Traffic Routing, Database Scaling, and Caching. Re-draw every Mermaid diagram from memory and explain the bottleneck each diagram is protecting.
 >
-> **Week 2:** Study Modules 04-05: Distributed Communication and Async Messaging. Then work through the blueprints and do at least one mock interview with a peer.
+> **Week 2:** Study beginner guides + modules 04-05: Distributed Communication and Async Messaging. Then modules 06-08: Service Mesh, Observability, and Security.
 >
-> **Daily:** Pick one failure scenario or “What if...?” section and explain the mitigation out loud in 3-5 minutes. Focus on what breaks first, what metric proves it, and what trade-off your fix introduces.
+> **Week 3:** Study beginner guides + modules 09-11: Microservices Patterns, Storage Systems, and Stream Processing. Then modules 12-13: Distributed Consensus and Capacity Planning.
+>
+> **Week 4:** Study module 14 (Interview Framework), work through all four blueprints, and do at least one mock interview with a peer.
+>
+> **Daily:** Pick one failure scenario or "What if...?" section and explain the mitigation out loud in 3-5 minutes. Focus on what breaks first, what metric proves it, and what trade-off your fix introduces.
 
 ---
 
@@ -271,10 +299,10 @@ Star history:
 
 What’s next:
 
-- Live Comments System blueprint with real-time WebSocket fanout.
 - Kubernetes deployment examples for each blueprint.
 - Video walkthroughs of each module.
 - Interactive quizzes for self-assessment.
+- Standalone runnable code templates for every module.
 
 ---
 
