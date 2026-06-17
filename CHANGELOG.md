@@ -6,6 +6,34 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 
 ---
 
+## v1.4.0 - 2026-06-17
+
+### Added
+
+- Expanded blueprints from 4 to 10 systems: WhatsApp/Messenger, Uber/Ride-Hailing, YouTube/Video Platform, Netflix/Streaming, Discord/Real-Time Comms, and Google Docs/Collaborative Editing.
+- Added `quiz/` directory with 280 questions across all 14 modules (20+ per module, three difficulty tiers).
+- Added `practice/` directory with mock interview simulator, 10-point scoring rubric, 15 design prompt cards, and 3 fully worked sample solutions (URL Shortener, Chat System, Rate Limiter).
+- Added `code/` directory with 8 runnable Python implementations: Consistent Hashing, Rate Limiter (token bucket + sliding window), O(1) LRU Cache, Circuit Breaker, Bloom Filter, Transactional Outbox, Chandy-Lamport Snapshot, and Raft Heartbeat — each with pytest tests.
+- Added Mermaid.js architecture diagrams to all 28 beginner and advanced Docs guides (flowcharts + sequence diagrams).
+- Added `.gitignore`, `.gitattributes`, and GitHub Actions CI workflow.
+
+### Changed
+
+- Updated README.md to document all 10 blueprints, 8 code modules, quiz banks, and practice materials.
+- Updated `quiz/README.md` with difficulty tier documentation.
+- Fixed circuit breaker implementation (5 failing tests) and Raft heartbeat election logic (2 failing tests).
+- Removed stale `Tests/test.md` placeholder.
+
+### Fixed
+
+- Circuit breaker test suite: all 5 tests now pass with proper exception-raising callables.
+- Raft heartbeat: `start_election()` now self-votes to handle single-node clusters; heartbeat test uses correct sub-timeout clock advance.
+- Blueprint count in README corrected from 4 to 10.
+- Removed TypeScript claims (repo is Python-only).
+- Removed "Interactive quizzes" from Roadmap (already delivered).
+
+---
+
 ## v1.3.0 - 2026-06-17
 
 ### Added
