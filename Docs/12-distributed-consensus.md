@@ -1,8 +1,18 @@
 # Distributed Transactions & Consensus – A Beginner's Guide
 
+**You've used this when...**
+
+You transfer money from your bank account to a friend's account. The money leaves your account. Does it arrive in theirs? If your bank's server crashes mid-transfer, the money could be lost forever. Distributed consensus is what ensures that either both accounts are updated or neither is — the transaction either completes fully or not at all.
+
+You use Kubernetes at work. A node running your critical service goes dark. Within seconds, the pod is rescheduled on another node. This works because etcd, Kubernetes' brain, uses the Raft consensus algorithm to agree on cluster state across multiple machines. Without consensus, K8s would not know which nodes are alive or where your pods should run.
+
+You browse Instagram. If you like a post, you expect that like to persist. But Instagram runs on hundreds of servers across the globe. Distributed consensus protocols ensure that data remains consistent across replicas — even if a server crashes mid-write or a network cable is accidentally cut.
+
 > This guide explains how multiple servers agree on a single truth even when some are failing, the network is broken, or messages are delayed.
 > Every technical term is defined the first time it appears, and a full Glossary is at the end.
 > Once you understand these foundations, the original advanced module will feel like a natural next step.
+>
+> **Before you start:** You should understand [Module 2: Database Scaling](/Docs/02-database-scaling.md) and [Module 4: Distributed Communication](/Docs/04-distributed-comm.md). If you haven't read those yet, start there.
 
 ---
 
@@ -19,6 +29,13 @@
 9. [Putting It All Together — Keeping a Database Consistent Across Three Servers](#9-putting-it-all-together--keeping-a-database-consistent-across-three-servers)
 10. [Glossary of Technical Terms](#10-glossary-of-technical-terms)
 11. [Key Takeaways](#11-key-takeaways)
+
+---
+
+> **⏱ TL;DR — If you only learn 3 things from this module:**
+> 1. **Distributed consensus is the art of getting unreliable machines to agree on a single truth** — without it, data is lost, systems diverge, and failures cascade.
+> 2. **Raft is the most practical consensus algorithm for real systems** — it uses a strong leader, randomized elections, and majority quorums. It is what powers etcd, Consul, and many production databases.
+> 3. **There is always a trade-off between consistency and availability** — 2PC blocks on failure, Raft tolerates crashes but pauses during elections, and Dynamo-style systems accept writes at the cost of eventual consistency and conflict resolution.
 
 ---
 
@@ -83,6 +100,26 @@ The extra phase gives participants enough information to decide unilaterally if 
 
 ## 4. Raft: Electing a Leader
 
+```mermaid
+sequenceDiagram
+    participant F1 as Follower 1
+    participant F2 as Follower 2
+    participant L as Leader
+
+    Note over F1,F2: Election Timeout
+    F1->>F1: Become Candidate
+    F1->>F2: RequestVote
+    F1->>L: RequestVote
+    F2->>F1: Vote Granted
+    L->>F1: Vote Granted
+    Note over F1: Elected Leader
+    L->>F1: AppendEntries (heartbeat)
+    L->>F2: AppendEntries (heartbeat)
+    F1->>L: Ack
+    F2->>L: Ack
+    Note over L: Log is committed (majority)
+```
+
 **Raft** is a consensus algorithm designed to be understandable. It solves the agreement problem by having a **strong leader** that makes all decisions.
 
 **Analogy:** Raft is like a parliamentary democracy. The leader (prime minister) is elected. Once elected, all decisions flow through the leader. If the leader becomes unreachable, a new election is held.
@@ -143,6 +180,15 @@ For a system with N=3, W=2, R=2:
 
 This gives **high availability**: the system can lose 1 node and still accept writes and reads.
 
+### Choosing a Consensus Approach
+
+| Approach | Use when... | Don't use when... |
+|----------|-------------|-------------------|
+| **2PC** | You need strong atomicity across a small number of participants and can accept blocking on coordinator failure. Short-lived transactions within a single datacenter. | You need high availability or low latency. The blocking problem means a single coordinator crash locks resources across all participants. Avoid when participants are geographically distributed. |
+| **3PC** | You want to avoid the blocking problem of 2PC and have a synchronous network where partitions are rare. | Almost never. It is complex to implement, adds latency from the extra round-trip, and still breaks under network partitions. Prefer 2PC with a highly available coordinator or Raft instead. |
+| **Raft** | You need crash-fault-tolerant consensus with strong consistency. Ideal for leader-based systems (distributed databases, configuration stores like etcd/Consul, replicated state machines). | You cannot tolerate brief write unavailability during leader elections (~ms to seconds). Avoid in adversarial environments where nodes may lie (use BFT instead). |
+| **Dynamo-style** | You need maximum write availability (accept writes even during network partitions). Suitable for systems that tolerate eventual consistency (shopping carts, content delivery, DNS). | You need strict serializability or when conflicting writes would cause business-critical data loss. Avoid if your application logic cannot handle conflict resolution (vector clocks, CRDTs). |
+
 ---
 
 ## 7. Vector Clocks: Detecting Conflicts
@@ -163,31 +209,48 @@ A **vector clock** is like a version counter attached to each piece of data. It 
 
 ---
 
+> **✏️ Check Your Understanding**
+> 1. You run a 3-node Raft cluster. One node fails due to a hardware fault. Can the cluster still accept writes? Why or why not?
+> 2. An e-commerce database uses 2PC to coordinate a payment and inventory deduction across two services. The coordinator crashes after receiving all "Yes" votes but before sending the commit. What happens to the inventory row locks?
+> 3. Your Dynamo-style database (N=3, W=2, R=2) has a network partition that splits off 1 node while you write to the remaining 2 nodes. A client then reads with R=2 — what happens if one of the responding nodes has not yet received the write?
+> <details>
+> <summary>Answers</summary>
+> 1. **Yes.** A 3-node cluster tolerates 1 failure. The remaining 2 nodes form a majority (2 of 3) and can continue accepting writes and electing a new leader if needed.
+> 2. **The inventory row locks remain held.** The participants voted "Yes" but are blocked — they cannot unilaterally commit (others might have aborted) or abort (others might have committed). They must wait for the coordinator to recover. This is the blocking problem of 2PC.
+> 3. **The query returns whichever version the majority of responded nodes have.** With R=2, you query 2 nodes. If one has the new write and the other does not, read-repair kicks in: the stale node is updated, and the client gets the latest version.
+> </details>
+
+---
+
 ## 8. Common Disasters and How to Avoid Them
 
 ### Split-Brain in Elasticsearch
-
-A 6-node Elasticsearch cluster is configured with `minimum_master_nodes: 3`. A network partition splits the cluster into two groups of 3. Each group elects its own master. Two masters means both groups accept writes independently. When the network heals, reconciling the divergent data is impossible — data is lost.
-
-**Mitigation:** Set `minimum_master_nodes` to a strict majority (`N/2 + 1`). For a 6-node cluster, that is 4 (not 3). This prevents any single group from electing a master. Also, use a **quorum-based approach** with a third node or witness.
+**Symptom:** A 6-node Elasticsearch cluster with `minimum_master_nodes: 3` experiences a network partition into two groups of 3. Each group elects its own master. Both groups accept writes independently. When the network heals, data is divergent and irreconcilable — queries return inconsistent results and data may be unrecoverable.
+**Root Cause:** The `minimum_master_nodes` was set to `N/2` (3 out of 6) instead of a strict majority (`N/2 + 1 = 4`). With 3 nodes in each partition, both groups met the threshold and independently elected a master.
+**Real Incident:** Multiple large-scale Elasticsearch outages have been caused by split-brain, including incidents at LinkedIn and Netflix where clusters became unrecoverable after network partitions, requiring restoration from snapshots.
+**Fix:** Set `minimum_master_nodes` to `N/2 + 1` (4 for a 6-node cluster). Use a dedicated tiebreaker or witness node if needed. In modern Elasticsearch versions, use the voting configuration exclusions API instead.
+**How to Detect Early:** Monitor `elasticsearch_discovery_zen_master_elected`. A sudden spike in master elections indicates potential split-brain. Alert on any period where multiple masters are reported as elected.
 
 ### The etcd Election Storm
-
-etcd (Kubernetes' consensus store) had an incident where Quality of Service (QoS) throttling slowed heartbeat messages. Heartbeats arrived late, triggering unnecessary elections. Each election caused more load, making the heartbeats slower, triggering more elections. 47 leader elections in 5 minutes. Kubernetes stopped working.
-
-**Mitigation:** Ensure the election timeout is much larger than the heartbeat interval. The rule: `broadcastTime ≪ electionTimeout ≪ MeanTimeBetweenFailures (MTBF)`.
+**Symptom:** etcd (Kubernetes' consensus store) experiences a cascading failure: heartbeats arrive late due to resource throttling, triggering leader elections. Each election generates more disk I/O and network traffic, slowing heartbeats further, triggering more elections. In production incidents, 47 leader elections occurred in 5 minutes, causing the Kubernetes API server to stop responding entirely.
+**Root Cause:** Quality of Service (QoS) throttling slowed heartbeat messages below the election timeout threshold. The system violated the Raft safety rule: `broadcastTime ≪ electionTimeout ≪ MTBF`. When the election timeout is not sufficiently larger than the heartbeat interval, transient slowdowns trigger false elections.
+**Real Incident:** A production Kubernetes cluster at a major cloud provider experienced total API unavailability when etcd entered an election storm loop under CPU throttling. The cluster required manual intervention to recover.
+**Fix:** Ensure `broadcastTime ≪ electionTimeout ≪ MTBF`. Set election timeouts to at least 10× the expected heartbeat round-trip time. Use dedicated CPU resources for etcd nodes to prevent QoS throttling from affecting heartbeat timing.
+**How to Detect Early:** Monitor `etcd_server_leader_changes_seen_total`. A rate of more than 1 leader change per minute is abnormal. Alert on any sustained increase in election count.
 
 ### 2-Node Raft Cluster
-
-A Raft cluster with 2 nodes has no fault tolerance. If 1 node fails, the remaining 1 node cannot form a majority. The system stops.
-
-**Mitigation:** Always run an odd number of nodes (3, 5, 7). A 3-node cluster tolerates 1 failure. A 5-node cluster tolerates 2.
+**Symptom:** A Raft cluster with exactly 2 nodes. One node fails. The remaining node cannot form a majority (needs 2 of 2, only has 1). The entire system stops accepting writes and electing leaders. Read-only operations may still work depending on configuration.
+**Root Cause:** A 2-node cluster has no fault tolerance. The majority threshold is `floor(2/2) + 1 = 2` nodes. If either node fails, the remaining 1 node cannot reach 2. The cluster is stuck.
+**Real Incident:** This is a common rookie mistake in production deployments. Multiple startups have deployed 2-node etcd or Consul clusters and discovered during an outage that their "highly available" configuration was actually a single point of failure.
+**Fix:** Always run an odd number of nodes (3, 5, or 7). A 3-node cluster tolerates 1 failure. A 5-node cluster tolerates 2. Never deploy a 2-node Raft cluster in production.
+**How to Detect Early:** Review cluster sizing before deployment. Monitor the number of etcd/Consul cluster members. Alert if the cluster size is even (2, 4, 6) instead of odd (3, 5, 7).
 
 ### The `alg: none` of Consensus
-
-In some JWT libraries, the server accepted "no algorithm" as valid (see the Security module). Similarly, in consensus, accepting writes without proper quorum is the equivalent — data is silently lost.
-
-**Mitigation:** Always enforce strict quorum checks. Never accept writes that have not been acknowledged by a majority.
+**Symptom:** A database cluster accepts writes that have not been acknowledged by a majority of nodes. A leader crashes after accepting a write locally but before replicating it. When a new leader is elected, the write is lost. The client believes the write succeeded, but the data is gone.
+**Root Cause:** The system was configured without strict quorum enforcement — writes committed with fewer than a majority of acknowledgments. This is the consensus equivalent of the JWT `alg: none` vulnerability: the safety check was disabled.
+**Real Incident:** MongoDB suffered from this issue before version 3.0 with its default write concern. A primary could acknowledge a write that had not been replicated to a majority. If the primary failed, the write would disappear when a new primary was elected.
+**Fix:** Always enforce strict quorum writes. In MongoDB, set `writeConcern: majority`. In Raft-based systems, never accept a write as committed until a majority of nodes have acknowledged it.
+**How to Detect Early:** Audit write concern and consistency settings in your database and consensus configurations. A sudden drop in write latency may indicate quorum checks have been disabled.
 
 ---
 
@@ -211,31 +274,42 @@ The write was never lost. The cluster survived a leader failure. The client expe
 
 ---
 
+> **🧪 Conceptual Exercises**
+> 1. **Airline Booking System:** You are designing a distributed airline reservation system with 5 data-center regions. A customer books a flight — this requires checking seat availability, reserving the seat, and processing payment. Analyze whether 2PC, Raft, or Dynamo-style consensus is most appropriate for the booking transaction. What happens if the payment processing datacenter becomes unreachable mid-transaction?
+> 2. **Distributed Like Counter:** Design a mechanism to maintain an accurate "like count" for a viral social media post receiving 1 million concurrent likes across 3 data centers. The count must be eventually accurate, but availability is critical. Compare how Raft and Dynamo-style approaches would handle this. What happens to the count during a 30-second network partition?
+> <details>
+> <summary>Hints</summary>
+> 1. Bookings have strong consistency requirements (double-booking must be impossible), but the system also needs high availability. Consider combining Raft for seat inventory within each region with a saga pattern across regions. What happens to the customer if the coordinator crashes after payment but before seat confirmation?
+> 2. Raft's single-leader approach creates a bottleneck — every like must go through one node, limiting throughput. Dynamo-style allows all nodes to accept writes but can over-count during partitions. Consider CRDT-based counters (G-Counter, PN-Counter) that provide automatic conflict-free merging as an alternative.
+> </details>
+
+---
+
 ## 10. Glossary of Technical Terms
 
-| Term | Definition |
-|------|------------|
-| **2PC (Two-Phase Commit)** | A protocol for atomic transactions across multiple nodes. Can block during coordinator failure. |
-| **3PC (Three-Phase Commit)** | An extension of 2PC that adds a pre-commit phase to avoid blocking. Rarely used in practice. |
-| **BFT (Byzantine Fault Tolerance)** | Consensus that tolerates nodes that intentionally lie or act maliciously. |
-| **Candidate** | A Raft node that is holding an election. |
-| **CFT (Crash Fault Tolerance)** | Consensus that tolerates nodes crashing but not malicious behavior. |
-| **Commit** | Making a log entry visible to clients (permanent). |
-| **Consensus** | The process of multiple servers agreeing on a single value or sequence of operations. |
-| **Coordinator** | The node managing a 2PC or 3PC transaction. |
-| **Election** | The process of selecting a new Raft leader. |
-| **Follower** | A passive Raft node that replicates the leader's log. |
-| **Heartbeat** | Periodic messages from the leader to followers to maintain authority. |
-| **Leader** | The single authoritative node in Raft that accepts writes and replicates data. |
-| **Log** | An ordered sequence of commands that the leader replicates to followers. |
-| **Majority / Quorum** | More than half of the nodes: `floor(N/2) + 1`. |
-| **Network Partition** | A condition where some nodes cannot communicate with others. |
-| **Quorum** | The minimum number of nodes needed to agree for a decision to be valid. |
-| **Raft** | A leader-based consensus algorithm designed for understandability. |
-| **Read-Repair** | In Dynamo, correcting stale replicas during a read operation. |
-| **Split-Brain** | Two partitions each electing a leader and accepting writes, causing divergence. |
-| **Term** | A logical time unit in Raft — each election starts a new term. |
-| **Vector Clock** | A data structure that tracks version history across nodes to detect conflicts. |
+| Term | Section | Definition |
+|------|---------|------------|
+| **Consensus** | 1 | The process of multiple servers agreeing on a single value or sequence of operations. |
+| **Network Partition** | 1 | A condition where some nodes cannot communicate with others. |
+| **2PC (Two-Phase Commit)** | 2 | A protocol for atomic transactions across multiple nodes. Can block during coordinator failure. |
+| **Coordinator** | 2 | The node managing a 2PC or 3PC transaction. |
+| **Commit** | 2 | Making a log entry visible to clients (permanent). |
+| **3PC (Three-Phase Commit)** | 3 | An extension of 2PC that adds a pre-commit phase to avoid blocking. Rarely used in practice. |
+| **Raft** | 4 | A leader-based consensus algorithm designed for understandability. |
+| **Leader** | 4 | The single authoritative node in Raft that accepts writes and replicates data. |
+| **Follower** | 4 | A passive Raft node that replicates the leader's log. |
+| **Candidate** | 4 | A Raft node that is holding an election. |
+| **Election** | 4 | The process of selecting a new Raft leader. |
+| **Heartbeat** | 4 | Periodic messages from the leader to followers to maintain authority. |
+| **Term** | 4 | A logical time unit in Raft — each election starts a new term. |
+| **Log** | 5 | An ordered sequence of commands that the leader replicates to followers. |
+| **Majority / Quorum** | 5 | More than half of the nodes: `floor(N/2) + 1`. |
+| **Quorum** | 5 | The minimum number of nodes needed to agree for a decision to be valid. |
+| **Read-Repair** | 6 | In Dynamo, correcting stale replicas during a read operation. |
+| **Vector Clock** | 7 | A data structure that tracks version history across nodes to detect conflicts. |
+| **Split-Brain** | 8 | Two partitions each electing a leader and accepting writes, causing divergence. |
+| **BFT (Byzantine Fault Tolerance)** | 11 | Consensus that tolerates nodes that intentionally lie or act maliciously. |
+| **CFT (Crash Fault Tolerance)** | 11 | Consensus that tolerates nodes crashing but not malicious behavior. |
 
 ---
 
@@ -255,6 +329,5 @@ The write was never lost. The cluster survived a leader failure. The client expe
 
 ---
 
-> This guide explains the "why" behind distributed consensus protocols.
-> Once you're comfortable with these concepts, the original module (with its Raft quorum simulator code, voting worked examples, and Elasticsearch split-brain case study) will serve as your in-depth reference.
+> Once you're comfortable with these concepts, dive deeper in the [advanced companion module](12-distributed-consensus-advanced.md), where we cover Raft log matching safety proofs, 3PC failure semantics, Dynamo NWR tuning with vector clock truncation risks, CFT-vs-BFT trade-offs, and election storm incident postmortems.
 > Remember: in a distributed system, agreeing on the truth is the hardest problem — and the most important one to get right.
