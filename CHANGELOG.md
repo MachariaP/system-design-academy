@@ -6,6 +6,32 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 
 ---
 
+## v1.3.0 - 2026-06-17
+
+### Added
+
+- Added advanced companion guides for all 14 modules in `Docs/` — each written from the perspective of a FAANG Principal Engineer with deep-dive sections, paper references (GFS, Dynamo, Raft, Facebook Memcached), real-world failure modes, and teacher's corner with grading rubrics:
+  - `01-traffic-routing-advanced.md` — L4/L7 packet journey, edge architecture, CDN trade-offs
+  - `02-database-scaling-advanced.md` — CAP theorem, SQL scaling, GFS control/data plane separation
+  - `03-caching-memory-advanced.md` — Facebook Memcached blueprint, eviction mathematics, Bloom filters
+  - `04-distributed-comm-advanced.md` — TCP vs UDP, RPC vs REST, circuit breakers, vector clocks
+  - `05-async-messaging-advanced.md` — back pressure, service discovery, Black Friday case study
+  - `06-service-mesh-advanced.md` — client-side vs server-side discovery, sidecar interception, control plane failure modes
+  - `07-observability-advanced.md` — W3C trace context, error budget math, cardinality explosion
+  - `08-security-auth-advanced.md` — JWT/JWKS, OAuth2 PKCE flow, mTLS, replay attack mitigation
+  - `09-microservices-patterns-advanced.md` — Saga choreography/orchestration, transactional outbox with CDC, CQRS/event sourcing
+  - `10-storage-systems-advanced.md` — block/file/object comparison, erasure coding math, bit rot detection
+  - `11-stream-processing-advanced.md` — log-centric architecture, watermark semantics, Lambda vs Kappa
+  - `12-distributed-consensus-advanced.md` — 2PC/3PC, Raft leader election, Dynamo vector clocks, election storms
+  - `13-capacity-planning-advanced.md` — latency constants, QPS/storage/bandwidth framework, 100M DAU photo app sizing
+  - `14-interview-framework-advanced.md` — 4-phase whiteboard roadmap, 10-point FAANG rubric, defensive whiteboarding
+
+### Changed
+
+- Updated all 14 beginner guides' closing notes to link to their respective advanced companions.
+
+---
+
 ## v1.1.0 - 2026-06-16
 
 ### Added
