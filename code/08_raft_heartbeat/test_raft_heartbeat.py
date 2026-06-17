@@ -57,7 +57,7 @@ def test_leader_heartbeats_prevent_election() -> None:
     n1.send_heartbeat("n2")
     n2.receive_append_entries("n1", n1.term)
 
-    t2[0] += 6.0
+    t2[0] += 4.0
     result = n2.tick()
     assert result is None
     assert n2.role == Role.FOLLOWER
