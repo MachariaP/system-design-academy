@@ -34,3 +34,7 @@ build/
 
 # Agent/tool artifacts
 graphify-out/
+
+# Testing artifacts
+.pytest_cache/
+scratch/
