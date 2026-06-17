@@ -2,7 +2,7 @@
 
 Learn how real distributed systems break, and how to design them so they recover.
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
+[![CI](https://github.com/MachariaP/system-design-academy/actions/workflows/ci.yml/badge.svg)](https://github.com/MachariaP/system-design-academy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Language: Python](https://img.shields.io/badge/language-Python-3776AB)](#)
 ![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -16,10 +16,14 @@ System Design Academy is a professional, open-source curriculum for engineers wh
 | Quick Overview | Details |
 |---|---|
 | **Modules** | 14 deep-dive modules |
-| **Blueprints** | 4 core blueprints |
+| **Blueprints** | 10 real-world walkthroughs |
 | **Beginner Docs** | 14 companion guides with plain-language explanations |
-| **Languages used** | Python, TypeScript |
-| **Paper references** | Dynamo, GFS, Facebook Memcached |
+| **Advanced Docs** | 14 FAANG-level deep-dives with paper references |
+| **Code Examples** | 8 runnable Python implementations with tests |
+| **Practice Materials** | Mock interview simulator, 15 prompt cards, scoring rubric, 3 worked solutions |
+| **Quiz Banks** | 280 questions across all 14 modules |
+| **Languages used** | Python |
+| **Paper references** | Dynamo, GFS, Facebook Memcached, Raft, MillWheel |
 | **Primary audience** | Backend engineers preparing for senior system design interviews |
 
 ---
@@ -63,9 +67,39 @@ Each module has **two companion guides** in the [`Docs/`](Docs/) directory:
 - 🟢 **Beginner guide** (`XX-module-name.md`) — plain language, everyday analogies, full glossary. Start here.
 - 🔴 **Advanced guide** (`XX-module-name-advanced.md`) — FAANG Principal Engineer deep-dive with paper references, failure modes, and teacher's corner with grading rubrics. Level up here.
 
+### Question Banks
+
+Test your understanding with [`quiz/`](quiz/) — 20 questions per module (280 total) spanning three tiers: 🟢 Beginner, 🟡 Intermediate, 🔴 FAANG-level. Each question links back to the relevant Docs guide.
+
+### Mock Interview Practice
+
+Prepare for the real thing with [`practice/`](practice/) — a timed interview simulator, 10-point scoring rubric, 15 design prompt cards, and 3 fully worked sample solutions (URL Shortener, Chat System, Rate Limiter).
+
+### Runable Code Examples
+
+Explore implementations in [`code/`](code/) — 8 modules covering Consistent Hashing, Rate Limiting (token bucket + sliding window), LRU Cache, Circuit Breaker, Bloom Filter, Transactional Outbox, Chandy-Lamport Snapshot, and Raft Heartbeat. Each has pytest tests. Run with:
+
+```bash
+pip install -r code/requirements.txt
+python -m pytest code/
+```
+
 ### Real-World System Design Blueprints
 
-Apply everything you learn in [`blueprints/system-designs.md`](blueprints/system-designs.md) — complete interview-ready designs for a **URL shortener**, **web crawler**, **Twitter/X timeline engine**, and **Live Comments system** with WebSocket fanout.
+Apply everything you learn in [`blueprints/system-designs.md`](blueprints/system-designs.md) — 10 complete interview-ready designs:
+
+| # | Blueprint | Key Focus |
+|---|-----------|-----------|
+| 1 | **URL Shortener** | ID generation, redirect caching, analytics pipeline |
+| 2 | **Web Crawler** | Frontier prioritization, politeness, deduplication |
+| 3 | **Twitter Timeline** | Fan-out hybrid, celebrity pull, cache hierarchy |
+| 4 | **Live Comments** | WebSocket fanout, per-room ordering, moderation tiering |
+| 5 | **WhatsApp / Messenger** | Inbox/outbox, e2ee, group fan-out hybrid |
+| 6 | **Uber / Ride-Hailing** | Geospatial indexing, Kafka GPS stream, surge pricing |
+| 7 | **YouTube / Video** | Transcoding DAG, DASH/HLS, hot/warm/cold CDN tiers |
+| 8 | **Netflix / Streaming** | Open Connect CDN, adaptive bitrate, chaos engineering |
+| 9 | **Discord / Real-Time** | Guild sharding, Cassandra messages, WebRTC relay |
+| 10 | **Google Docs / Collab** | OT vs CRDT, WebSocket sync, revision history |
 
 ### Recommended Learning Path
 
@@ -76,7 +110,7 @@ flowchart LR
     M3["03 Caching<br/>Memcached, LRU, stampedes"]
     M4["04 Distributed Communication<br/>gRPC, Raft, idempotency"]
     M5["05 Async Messaging<br/>queues, DLQs, backpressure"]
-    BP["Blueprints<br/>URL shortener, crawler, timeline,<br/>live comments"]
+    BP["10 Blueprints<br/>URL shortener, WhatsApp, Uber,<br/>YouTube, Netflix, & more"]
 
     M1 --> M2
     M2 --> M3
@@ -97,7 +131,7 @@ Most system design resources stop at boxes and arrows. This repository is built 
 | Differentiator | What It Means |
 |---|---|
 | **Whiteboard-ready trade-offs** | Every concept is framed with decision matrices, staff-engineer notes, and interview-ready trade-off language. |
-| **Production code templates** | Runnable Python and TypeScript examples cover reverse proxies, consistent hashing, LRU caches, gRPC services, RabbitMQ workers, circuit breakers, and retries. |
+| **Production code templates** | Runnable Python examples cover consistent hashing, rate limiting, LRU caches, circuit breakers, Bloom filters, transactional outbox, consistent snapshots, and Raft leader election — each with pytest tests. |
 | **Failure-driven explanations** | Modules explain how systems fail: split-brain, cache stampedes, poison messages, retry storms, replication lag, and hot partitions. |
 | **Paper-to-practice** | Lessons from Dynamo, GFS, and Facebook Memcached are translated into actionable architecture patterns. |
 
@@ -111,7 +145,7 @@ You will still get Mermaid-rendered architecture diagrams, FAANG-style interview
 |---|---|
 | Basic networking: TCP, HTTP, DNS | Needed for routing, load balancing, and failure-mode discussions |
 | SQL and NoSQL fundamentals | Needed for replication, sharding, indexing, and consistency trade-offs |
-| Ability to read Python or TypeScript pseudocode | Code templates use both languages |
+| Ability to read Python | Code templates use Python |
 | Interest in distributed systems | Consensus, replication, messaging, and retries show up throughout |
 
 Optional but helpful:
@@ -136,6 +170,8 @@ cd system-design-academy
 Recommended reading flow — start with a beginner guide, then the advanced module:
 
 ```text
+quiz/01-traffic-routing.md          (test your knowledge)
+practice/interview-simulator.md     (mock interview practice)
 Docs/01-traffic-routing.md          →  modules/01-traffic-routing.md
 Docs/02-database-scaling.md         →  modules/02-database-scaling.md
 Docs/03-caching-memory.md           →  modules/03-caching-memory.md
@@ -150,7 +186,7 @@ Docs/11-stream-processing.md        →  modules/11-stream-processing.md
 Docs/12-distributed-consensus.md    →  modules/12-distributed-consensus.md
 Docs/13-capacity-planning.md        →  modules/13-capacity-planning.md
 Docs/14-interview-framework.md      →  modules/14-interview-framework.md
-blueprints/system-designs.md        (apply everything)
+blueprints/system-designs.md        (apply everything with 10 walkthroughs)
 ```
 
 Recommended study loop:
@@ -165,38 +201,19 @@ Recommended study loop:
 
 ## Running The Code Locally
 
-The academy is primarily Markdown-based, but the modules include standalone Python and TypeScript templates you can run or adapt.
+The `code/` directory contains standalone Python implementations with tests for 8 system design patterns.
 
 ```bash
-# Clone the repo
-git clone https://github.com/MachariaP/system-design-academy.git
-cd system-design-academy
-
 # Set up Python virtual environment for code examples
 python -m venv venv
 source venv/bin/activate  # or .\venv\Scripts\activate on Windows
-pip install -r requirements.txt
+pip install -r code/requirements.txt
+
+# Run all tests
+python -m pytest code/
 ```
 
-Example workflow for Python snippets:
-
-```bash
-# Create a local scratch file for a module snippet, then run it
-mkdir -p scratch
-# Example: paste the consistent hashing demo from modules/02-database-scaling.md
-python scratch/consistent_hashing_demo.py
-```
-
-Example workflow for TypeScript snippets:
-
-```bash
-# Reverse proxy examples use Node.js packages
-npm init -y
-npm install prom-client tsx
-npx tsx scratch/proxy.ts
-```
-
-Each module’s code blocks are designed to be standalone and can be copied directly into a scratch file. Some examples need external services such as RabbitMQ, PostgreSQL, or Toxiproxy; the relevant module notes call those dependencies out.
+Each code module’s code blocks are designed to be standalone and can be copied directly into a scratch file. Some examples need external services such as RabbitMQ, PostgreSQL, or Toxiproxy; the relevant module notes call those dependencies out.
 
 ---
 
@@ -210,7 +227,7 @@ Each module’s code blocks are designed to be standalone and can be copied dire
 >
 > **Week 3:** Study beginner guides + modules 09-11: Microservices Patterns, Storage Systems, and Stream Processing. Then modules 12-13: Distributed Consensus and Capacity Planning.
 >
-> **Week 4:** Study module 14 (Interview Framework), work through all four blueprints, and do at least one mock interview with a peer.
+> **Week 4:** Study module 14 (Interview Framework), work through all 10 blueprints, and do at least one mock interview with a peer.
 >
 > **Daily:** Pick one failure scenario or "What if...?" section and explain the mitigation out loud in 3-5 minutes. Focus on what breaks first, what metric proves it, and what trade-off your fix introduces.
 
@@ -233,7 +250,9 @@ Contributions are welcome, especially from engineers who want to add practical, 
 | Contribution Type | What To Include |
 |---|---|
 | **New system design blueprint** | Requirements table, architecture diagram, component deep-dive, failure scenarios, decision log |
-| **Code template** | Language, dependencies, usage example, error handling, observability |
+| **Quiz question bank** | 20 questions (8/6/6 tier split), `<details>` hidden answers, Docs/ references |
+| **Code template** | Python, typed signatures, docstrings, pytest tests |
+| **Practice material** | Interview prompt, sample solution, rubric alignment |
 | **Diagram improvement** | Mermaid source, caption, clear separation of control plane and data plane |
 | **Typo or clarification** | Brief description and why it improves accuracy |
 
