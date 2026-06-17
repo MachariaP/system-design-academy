@@ -1,10 +1,18 @@
 # Observability: Monitoring, Logging & Tracing – A Beginner's Guide
 
+You've used this when a website told you "Something went wrong" and you had no idea what. Was it your internet? The server? A database? Without observability, debugging a distributed system is like finding a leak in a house with the lights off.
+
+You've also experienced observability working well: when a mobile app shows you "We're investigating the slow loading times" and 10 minutes later posts "Found it — fixed a slow database query." That rapid diagnosis doesn't happen by luck. It happens because the team can see metrics (response times spiked), traces (the database call was the slowest step), and logs (the query was missing an index).
+
+Observability is the difference between guessing and knowing. It turns a black box into a glass box — and it's the single most important investment you can make before your system goes to production.
+
 > This guide explains the three pillars of observability — Metrics, Logs, and Traces — and how they work together to help you understand what your system is doing, why it is failing, and where to look.
 > Every technical term is defined the first time it appears, and a full Glossary is at the end.
 > Once you understand these foundations, the original advanced module will feel like a natural next step.
 
 ---
+
+> **Before you start:** This module is foundational with no prerequisites — you can jump right in.
 
 ## Table of Contents
 
@@ -22,6 +30,13 @@
 
 ---
 
+> **⏱ TL;DR — If you only learn 3 things from this module:**
+> 1. **Metrics tell you what, logs tell you why, traces tell you where** — you need all three pillars to debug effectively. Any one alone is incomplete.
+> 2. **SLIs → SLOs → Error Budgets** form a data-driven reliability framework that tells you when to ship features and when to stop and fix things.
+> 3. **High cardinality kills time-series databases** — never use user IDs or session IDs as metric labels. Use traces for high-cardinality data.
+
+---
+
 ## 1. Why Observability Matters
 
 When your application is a single process running on one machine, you can debug it by looking at the console, attaching a debugger, or checking a single log file. But in a distributed system with hundreds of microservices, a request may pass through 10 different services, each running on a different machine in a different data center. You cannot attach a debugger to all of them at once.
@@ -31,6 +46,34 @@ When your application is a single process running on one machine, you can debug 
 ---
 
 ## 2. The Three Pillars: Metrics, Logs, Traces
+
+```mermaid
+flowchart LR
+    User["User Request"]
+    S1["Service A<br/>(API Gateway)"]
+    S2["Service B<br/>(Auth)"]
+    S3["Service C<br/>(Database)"]
+
+    User --> S1
+    S1 --->|Trace: span A| S2
+    S2 --->|Trace: span B| S3
+
+    subgraph Metrics["Metrics (Prometheus)"]
+        M1["Latency p99<br/>Request rate<br/>Error rate"]
+    end
+
+    subgraph Logs["Logs (Elasticsearch)"]
+        L1["2024-01-01 12:00:00 ERROR<br/>db connection timeout<br/>2024-01-01 12:00:01 INFO<br/>retry succeeded"]
+    end
+
+    subgraph Traces["Traces (Jaeger)"]
+        T1["Root span: POST /order<br/>├─ Auth span: 5ms<br/>├─ DB span: 120ms<br/>└─ Payment span: 800ms"]
+    end
+
+    S1 -.-> Metrics
+    S1 & S2 & S3 -.-> Logs
+    S1 & S2 & S3 -.-> Traces
+```
 
 Relying on only one type of telemetry is like diagnosing a car with only a speedometer:
 
@@ -97,8 +140,11 @@ Structured logs can be indexed and queried: "How many `insufficient_funds` error
 **Why traces are critical:** In a distributed system, a single user request might touch 10-15 services. Without traces, you have 15 sets of metrics and 15 log files. With traces, you can see exactly which service caused the slowdown.
 
 **The cost of traces:** Storing every span for every request is expensive. Most systems use **sampling**:
-- **Head-based sampling:** Decide at the start of a request whether to trace it (e.g., trace 1% of requests). Simple but may miss rare errors.
-- **Tail-based sampling:** Trace everything temporarily, then decide which traces to keep based on what happened (e.g., keep all traces with errors). More complex but captures more signal.
+
+| Approach | Use when… | Don't use when… |
+|----------|-----------|-----------------|
+| **Head-based sampling** | Budget is tight; you need a simple, predictable trace volume; most errors are frequent enough to be captured at 1% | Rare errors account for significant user impact — head-based will almost always miss them |
+| **Tail-based sampling** | Error rates are low but critical; you need every error trace preserved for debugging | Your trace volume is extremely high (tail-based requires buffering all traces temporarily, which is memory-intensive) |
 
 ---
 
@@ -122,10 +168,10 @@ These three concepts form the contract between your team and your users about re
 
 There are two main ways to collect telemetry:
 
-| Architecture | How it works | Best for |
-|-------------|--------------|----------|
-| **Pull (Prometheus)** | The monitoring server polls each service's `/metrics` endpoint at regular intervals. | Persistent services running on known servers. |
-| **Push (StatsD, OpenTelemetry Collector)** | Each service sends metrics to a central collector, which buffers and forwards them. | Ephemeral workloads (Lambda, short-lived batch jobs) that will not be around when the poller asks. |
+| Approach | Use when… | Don't use when… |
+|----------|-----------|-----------------|
+| **Pull (Prometheus)** | Services run persistently on known servers; you want centralized scrape control | Services are ephemeral (Lambda, batch jobs) and may disappear before the next poll; the `/metrics` endpoint might overload a struggling service |
+| **Push (StatsD, OpenTelemetry Collector)** | Workloads are short-lived or serverless; you need the service to control when data is sent | The collector could become a bottleneck or crash, losing metrics; you lose visibility if the network between service and collector is congested |
 
 **The danger of push:** If the collector crashes or the network is congested, metrics can be lost. The service thinks it sent data, but nobody received it.
 
@@ -133,25 +179,56 @@ There are two main ways to collect telemetry:
 
 ---
 
+> **✏️ Check Your Understanding**
+> 1. Your dashboard shows that the error rate for the payment service suddenly dropped to zero. Is that good news? What could it actually mean?
+> 2. You add a `customer_tier` label (gold, silver, bronze) to your request latency metric. Is this safe? What about adding `customer_id`?
+> 3. A user reports a bug you have never seen before. Your traces sample 1% of requests. The bug affects 0.1% of users. What is the probability that you captured it in a trace? How would you improve the odds?
+> <details>
+> <summary>Answers</summary>
+> 1. **Not necessarily.** An error rate drop to zero could mean nobody is hitting the service (the metrics pipeline is broken, the service is down, or requests are being rejected before they reach the service). Always investigate sudden drops, not just spikes.
+> 2. **`customer_tier` is safe** (low cardinality — only 3 values). **`customer_id` is dangerous** (high cardinality — millions of values). High-cardinality labels blow up TSDB memory and should be avoided in metrics.
+> 3. **Very low.** With 1% sampling and 0.1% error rate, you have roughly a 0.001% chance of capturing that error. Use tail-based sampling to keep all error traces, or increase the sampling rate for the specific endpoint.
+> </details>
+
+---
+
 ## 8. Common Disasters and How to Avoid Them
 
 ### Cardinality Explosion
 
-You decide to add a `user_id` label to your metrics to track per-user performance. If you have 1 million active users, your metric now has 1 million unique label combinations. The TSDB's memory usage goes from megabytes to gigabytes in minutes, causing an Out-Of-Memory (OOM) crash.
+**Symptom:** Prometheus or your TSDB runs out of memory and crashes. Dashboards stop loading. Queries time out.
 
-**Mitigation:** Never use unbounded values (user IDs, session IDs, email addresses) as metric labels. Use high-cardinality data in traces, not metrics.
+**Root Cause:** A metric with a high-cardinality label (like `user_id`, `session_id`, or `email`) was added. With 1 million users, the TSDB must track 1 million unique time series — each consuming memory and disk.
+
+**Real Incident:** In 2016, a major observability vendor experienced a multi-hour outage when a single customer added a `user_id` label to a metric, causing the TSDB's memory to spike from 4GB to 100GB in minutes. The shared infrastructure affected all customers.
+
+**Fix:** Never use unbounded values (user IDs, session IDs, email addresses, IP addresses) as metric labels. Use high-cardinality data in traces or logs, not metrics. Enforce label limits in your metrics pipeline (e.g., Prometheus `label_limit` configuration).
+
+**How to Detect Early:** Monitor TSDB memory usage and unique series count. Alert if the number of series grows by more than 20% in an hour. Set up a pre-commit hook that rejects metrics with potentially unbounded labels.
 
 ### Head-Based Sampling Misses Rare Errors
 
-You trace 1% of all requests. A rare bug causes a 0.01% error rate. You have a 1 in 10,000 chance of capturing that error in your traces. You will almost never see it.
+**Symptom:** A rare bug is causing errors, but your trace dashboard shows zero error traces. Customer support is flooded with reports you cannot reproduce.
 
-**Mitigation:** Use tail-based sampling (keep all traces with errors) or increase the sampling rate for error spans.
+**Root Cause:** Head-based sampling decides whether to trace a request at the start, before knowing the outcome. If you sample 1% of requests and the error rate is 0.01%, only 1 in 10,000 error requests will be traced. You are effectively blind to rare errors.
+
+**Real Incident:** A large streaming service discovered that 0.05% of video playback failures were caused by a codec negotiation bug that only occurred with specific device/browser combinations. Their 1% head-based sampling caught exactly zero instances in three months.
+
+**Fix:** Use tail-based sampling (keep all traces with errors) or increase the sampling rate for error spans. If tail-based is too expensive, use adaptive sampling that boosts the sampling rate for services or endpoints with higher error rates.
+
+**How to Detect Early:** Compare your sampled error rate (from traces) with your actual error rate (from metrics). If the trace error rate is consistently lower, sampling is missing errors.
 
 ### The 15-Minute Blind Spot
 
-Your push-based metrics collector (StatsD) sends data in batches every 15 minutes. During a Black Friday sale, the payment service starts failing. The ops team does not notice for 15 minutes because the metrics are from before the failure.
+**Symptom:** Your dashboard shows normal metrics, but users are reporting outages. By the time the metrics update, 15 minutes have passed.
 
-**Mitigation:** Use real-time streaming (sub-minute granularity) for critical metrics. Batch for cost savings on non-critical ones.
+**Root Cause:** Push-based metrics collectors (StatsD) send data in infrequent batches (e.g., every 15 minutes) to reduce cost. A failure that starts between batches is invisible until the next batch arrives.
+
+**Real Incident:** During a Black Friday sale, a major retailer's payment gateway went down for 22 minutes before the ops team noticed. Their monitoring pipeline had a 15-minute batch interval, and the failure started 7 minutes after the last successful batch. The team lost 22 minutes of revenue before reacting.
+
+**Fix:** Use real-time streaming (sub-minute granularity) for critical metrics (error rates, latency, throughput). Reserve batching for non-critical, high-volume, or aggregate metrics where delayed insight is acceptable.
+
+**How to Detect Early:** For critical services, set up a synthetic heartbeat check that runs every 30 seconds. If the heartbeat fails, page immediately — don't wait for the next metrics batch. Monitor the age of the most recent data point and alert if it exceeds the expected interval.
 
 ---
 
@@ -174,34 +251,45 @@ Without all three pillars, you would have known *something* was slow (metrics), 
 
 ---
 
+> **🧪 Conceptual Exercises**
+> 1. A user reports that checkout is slow. Your dashboard shows p99 latency is normal. Traces show one particular database query timing out 0.5% of the time. Logs show "connection pool exhausted." Walk through how you would use all three pillars to diagnose and fix this.
+> 2. Your team adopts tail-based sampling for traces. Your infrastructure budget is fixed, and trace storage costs triple. How would you decide which traces to keep and which to discard? What metrics would you track to ensure you are not losing signal?
+> <details>
+> <summary>Hints</summary>
+> For question 1, think about what each pillar reveals: metrics show the aggregate (p99 is fine, but p999 might be bad), traces pinpoint the exact slow step, logs reveal the root cause (pool exhaustion). For question 2, consider that tail-based keeps traces with errors by default — but you may also want to keep slow traces, traces from high-value users, or a representative sample of healthy traces for baseline comparison.
+> </details>
+
+---
+
 ## 10. Glossary of Technical Terms
 
-| Term | Definition |
-|------|------------|
-| **Burn Rate** | The rate at which you consume your error budget. High burn rate = immediate action required. |
-| **Cardinality** | The number of unique values a label or field can have. High cardinality = expensive. |
-| **Correlation ID** | A unique identifier attached to a request that flows through all services and log entries. |
-| **Counter** | A metric that only increases (e.g., total requests). |
-| **Error Budget** | The acceptable amount of unreliability: 100% minus your SLO target. |
-| **Gauge** | A metric that goes up and down (e.g., current memory). |
-| **Head-Based Sampling** | Deciding at the start of a request whether to trace it. |
-| **Histogram** | A metric that records a distribution of values (e.g., latency percentiles). |
-| **Logs** | Discrete records of events, ideally in structured (JSON) format. |
-| **Metrics** | Numerical measurements aggregated over time. |
-| **Observability** | The ability to understand a system's internal state from its external outputs. |
-| **OpenTelemetry** | An open standard for generating, collecting, and exporting telemetry data. |
-| **p50 / p95 / p99** | The latency value below which 50%/95%/99% of requests fall. p99 is the most important for user experience. |
-| **Prometheus** | A popular pull-based metrics and alerting system. |
-| **Sampling** | Recording only a subset of traces to reduce cost. |
-| **SLI (Service Level Indicator)** | A specific metric that measures reliability (e.g., latency, error rate). |
-| **SLO (Service Level Objective)** | The target value for an SLI (e.g., 99.9% of requests succeed). |
-| **Span** | A single unit of work within a trace (e.g., a database query). |
-| **Structured Logging** | Logging in a machine-readable format (JSON) rather than free text. |
-| **Tail-Based Sampling** | Deciding which traces to keep after seeing the full result (keeps errors). |
-| **Three Pillars** | Metrics, Logs, and Traces — the three types of telemetry data. |
-| **Trace** | The complete path of a single request through a distributed system. |
-| **Trace ID** | A unique identifier shared by all spans in a single request. |
-| **TSDB (Time-Series Database)** | A database optimized for storing and querying metrics with timestamps. |
+| Term | Definition | Section |
+|------|------------|---------|
+| **Observability** | The ability to understand a system's internal state from its external outputs. | 1 |
+| **Three Pillars** | Metrics, Logs, and Traces — the three types of telemetry data. | 2 |
+| **Metrics** | Numerical measurements aggregated over time. | 2 |
+| **Logs** | Discrete records of events, ideally in structured (JSON) format. | 2 |
+| **Traces** | The complete path of a single request through a distributed system. | 2 |
+| **Counter** | A metric that only increases (e.g., total requests). | 3 |
+| **Gauge** | A metric that goes up and down (e.g., current memory). | 3 |
+| **Histogram** | A metric that records a distribution of values (e.g., latency percentiles). | 3 |
+| **Prometheus** | A popular pull-based metrics and alerting system. | 3 |
+| **TSDB (Time-Series Database)** | A database optimized for storing and querying metrics with timestamps. | 3 |
+| **Structured Logging** | Logging in a machine-readable format (JSON) rather than free text. | 4 |
+| **Correlation ID** | A unique identifier attached to a request that flows through all services and log entries. | 4 |
+| **Trace** | The complete path of a single request through a distributed system. | 5 |
+| **Trace ID** | A unique identifier shared by all spans in a single request. | 5 |
+| **Span** | A single unit of work within a trace (e.g., a database query). | 5 |
+| **Sampling** | Recording only a subset of traces to reduce cost. | 5 |
+| **Head-Based Sampling** | Deciding at the start of a request whether to trace it. | 5 |
+| **Tail-Based Sampling** | Deciding which traces to keep after seeing the full result (keeps errors). | 5 |
+| **OpenTelemetry** | An open standard for generating, collecting, and exporting telemetry data. | 5 |
+| **p50 / p95 / p99** | The latency value below which 50%/95%/99% of requests fall. p99 is the most important for user experience. | 5 |
+| **SLI (Service Level Indicator)** | A specific metric that measures reliability (e.g., latency, error rate). | 6 |
+| **SLO (Service Level Objective)** | The target value for an SLI (e.g., 99.9% of requests succeed). | 6 |
+| **Error Budget** | The acceptable amount of unreliability: 100% minus your SLO target. | 6 |
+| **Burn Rate** | The rate at which you consume your error budget. High burn rate = immediate action required. | 6 |
+| **Cardinality** | The number of unique values a label or field can have. High cardinality = expensive. | 8 |
 
 ---
 
@@ -222,4 +310,5 @@ Without all three pillars, you would have known *something* was slow (metrics), 
 
 > This guide explains the "why" behind observability patterns.
 > Once you're comfortable with these concepts, the original module (with its OpenTelemetry details, PromQL burn rate alerts, and structured logging code) will serve as your in-depth reference.
+> For a deep-dive into burn rate alerting math, tail-based sampling at 500K QPS, cardinality explosion mechanics, and Google SLO engineering, read the [advanced companion file](07-observability-advanced.md) — written from a Staff SRE's perspective.
 > Remember: you cannot fix what you cannot see — invest in observability before you need it.
