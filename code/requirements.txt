@@ -1,0 +1,3 @@
+pytest>=8.0
+mmh3>=5.0
+bitarray>=3.0
