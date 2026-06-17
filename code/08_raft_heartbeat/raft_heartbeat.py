@@ -45,6 +45,7 @@ class RaftNode:
         self.voted_for = self.id
         self._votes_received = {self.id}
         self.last_heartbeat = self._now()
+        self.receive_vote(self.id)
 
     def request_vote(self, candidate_id: str, candidate_term: int) -> bool:
         """Handle a RequestVote RPC. Returns True if vote granted."""
