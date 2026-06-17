@@ -4,13 +4,13 @@ Comprehensive question banks for all 14 modules of the System Design Academy cur
 
 ## Structure
 
-Each module file contains **20 questions** spanning three difficulty tiers:
+Each module file contains **20+ questions** spanning three difficulty tiers:
 
-| Tier | Count | Icon | Description |
-|------|-------|------|-------------|
-| Beginner | 8 | 🟢 | Core concepts, definitions, basic trade-offs |
-| Intermediate | 6 | 🟡 | Design reasoning, common pitfalls, moderate complexity |
-| Advanced | 6 | 🔴 | Multi-step FAANG-level reasoning, whiteboard exercises |
+| Tier | Approx. Count | Icon | Description |
+|------|---------------|------|-------------|
+| Beginner | 8-9 | 🟢 | Core concepts, definitions, basic trade-offs |
+| Intermediate | 6-7 | 🟡 | Design reasoning, common pitfalls, moderate complexity |
+| Advanced | 6-7 | 🔴 | Multi-step FAANG-level reasoning, whiteboard exercises |
 
 ## Question Types
 
