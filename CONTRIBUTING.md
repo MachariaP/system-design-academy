@@ -17,6 +17,8 @@ Open an issue if you find:
 - Broken links or formatting problems.
 - Mermaid diagrams that do not render correctly.
 - Code snippets that are incorrect, unclear, or unsafe.
+- Quiz question banks with incorrect answers or tier misclassification.
+- Practice materials with inaccurate rubrics or sample solutions.
 - Capacity estimates that need correction or stronger assumptions.
 
 When reporting an issue, please include:
@@ -38,6 +40,9 @@ Examples:
 - Designing a Distributed Lock Service.
 - Designing a Search Autocomplete System.
 - Designing a Video Streaming Platform.
+- Adding quiz question banks for existing or new modules.
+- Creating practice interview prompts and sample solutions.
+- Writing production-grade code implementations and tests.
 
 For new blueprints, please include:
 
@@ -57,6 +62,9 @@ You can also contribute by improving:
 - Mermaid architecture diagrams.
 - Comparison tables and matrices.
 - Interview checklists and rubrics.
+- Quiz question banks and answer explanations.
+- Practice materials and mock interview simulations.
+- Test coverage for code implementations.
 - Formatting, readability, and organization.
 
 ---
@@ -76,14 +84,17 @@ Please follow this pull request flow:
 4. Ensure all diagrams use valid Mermaid syntax.
 5. Ensure code examples are documented and easy to run or adapt.
 6. For Python snippets, follow PEP8 conventions.
-7. Keep changes focused and avoid unrelated formatting churn.
-8. Commit with a clear message:
+7. For quiz submissions, verify the 8/6/6 tier split and `<details>` answer-hiding format.
+8. For practice submissions, align rubrics with the 10-point scoring system in `practice/scoring-rubric.md`.
+9. For code submissions, ensure all tests pass with `python -m pytest code/`.
+10. Keep changes focused and avoid unrelated formatting churn.
+11. Commit with a clear message:
 
-   ```bash
-   git commit -m "Add rate limiter system design blueprint"
-   ```
+    ```bash
+    git commit -m "Add rate limiter system design blueprint"
+    ```
 
-9. Push your branch and open a pull request.
+12. Push your branch and open a pull request.
 
 In your pull request description, include:
 
