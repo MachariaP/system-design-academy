@@ -1,0 +1,25 @@
+# System Design Academy .gitattributes
+
+# Normalize line endings to LF for all text files
+* text=auto eol=lf
+
+# Markdown
+*.md text diff=markdown
+
+# Python
+*.py text diff=python
+
+# YAML
+*.yml text
+*.yaml text
+
+# Shell
+*.sh text eol=lf
+
+# Batch
+*.bat text eol=crlf
+
+# Images
+*.png binary
+*.jpg binary
+*.svg binary
