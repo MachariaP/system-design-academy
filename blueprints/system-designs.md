@@ -20,6 +20,21 @@ Each blueprint is structured for senior system design loops: **bound the problem
 
 ---
 
+## Table of Contents
+
+1. [URL Shortener](#url-shortener)
+2. [Web Crawler](#web-crawler)
+3. [Twitter Timeline](#twitter-timeline)
+4. [Live Comments System](#live-comments-system)
+5. [WhatsApp / Messenger](#whatsapp--messenger)
+6. [Uber / Ride-Hailing](#uber--ride-hailing)
+7. [YouTube / Video Platform](#youtube--video-platform)
+8. [Netflix / Streaming Service](#netflix--streaming-service)
+9. [Discord / Real-Time Communications](#discord--real-time-communications)
+10. [Google Docs / Collaborative Editing](#google-docs--collaborative-editing)
+
+---
+
 ### URL Shortener
 
 #### 1. Requirements & Bounding (Include clear calculation tables for Storage, QPS, and Bandwidth numbers)
