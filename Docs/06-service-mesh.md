@@ -1,10 +1,18 @@
 # Service Discovery & Service Mesh – A Beginner's Guide
 
+You've used this when you opened a mobile app and it immediately showed your profile, orders, and recommendations — all fetched from different backend services. Behind the scenes, those services had to discover each other, establish secure connections, and share data, all without dropping your request.
+
+You've also felt the pain when it breaks. When a site shows "Something went wrong" after you log in, it might be because the auth service couldn't find the user profile service — they lost track of each other in the cloud. Service meshes solve exactly this kind of problem.
+
+Service discovery and service mesh are the invisible plumbing that makes microservices work. They handle finding the right service instance, encrypting communication, retrying failures, and even shifting traffic between versions — all without touching a single line of application code. Let's see how.
+
 > This guide explains how services find each other in a dynamic cloud environment and how a service mesh secures and manages their communication without changing application code.
 > Every technical term is defined the first time it appears, and a full Glossary is at the end.
 > Once you understand these foundations, the original advanced module will feel like a natural next step.
 
 ---
+
+> **Before you start:** You should understand [Module 1: Traffic Routing](../Docs/01-traffic-routing.md) and [Module 4: Distributed Communication Patterns](../Docs/04-distributed-comm.md). If you haven't read those yet, start there.
 
 ## Table of Contents
 
@@ -21,6 +29,13 @@
 11. [Putting It All Together — A Request Through a Mesh](#11-putting-it-all-together--a-request-through-a-mesh)
 12. [Glossary of Technical Terms](#12-glossary-of-technical-terms)
 13. [Key Takeaways](#13-key-takeaways)
+
+---
+
+> **⏱ TL;DR — If you only learn 3 things from this module:**
+> 1. **Services change addresses constantly** — hardcoded IPs break when instances restart or scale. A service registry keeps a live directory of where every service is.
+> 2. **A service mesh moves network logic into infrastructure** — sidecar proxies handle discovery, encryption, routing, and retries so application code stays simple.
+> 3. **mTLS and circuit breakers are built-in safety nets** — every service-to-service call is authenticated and encrypted by default, and failing dependencies are isolated before they cause cascading failures.
 
 ---
 
@@ -64,12 +79,10 @@ There are two main ways to use a service registry.
 **Pros:** The client does not need to know anything — it just sends requests to a fixed address. Much simpler client code.
 **Cons:** The load balancer becomes a single point of failure (unless replicated) and adds latency.
 
-| Factor | Client-Side | Server-Side |
-|--------|-------------|-------------|
-| Network hops | 1 (direct) | 2 (via load balancer) |
-| Client complexity | High (must embed registry library) | Low (just calls a static address) |
-| Central bottleneck | No | Yes (the load balancer) |
-| Example tools | Eureka, Consul | AWS ALB, Kubernetes, Nginx |
+| Approach | Use when… | Don't use when… |
+|----------|-----------|-----------------|
+| Client-Side Discovery | You need lowest latency (1 hop); you control all service code and can embed registry libraries | You cannot modify client code; you want to keep clients simple; your services are written in many languages |
+| Server-Side Discovery | You want simple clients (just call a fixed address); your environment already has a load balancer (Kubernetes, AWS ALB) | You need direct client-to-server connections; the load balancer is a single point of failure without replication |
 
 ---
 
@@ -90,6 +103,20 @@ A **service mesh** is a dedicated infrastructure layer that handles all service-
 ---
 
 ## 5. The Two Layers: Control Plane vs Data Plane
+
+```mermaid
+flowchart TB
+    CP["Control Plane<br/>(Istiod / Consul)"]
+    subgraph Nodes["Service Mesh (Data Plane)"]
+        S1["Service A<br/>Sidecar Proxy<br/>(Envoy)"]
+        S2["Service B<br/>Sidecar Proxy<br/>(Envoy)"]
+        S3["Service C<br/>Sidecar Proxy<br/>(Envoy)"]
+    end
+
+    CP -->|Configures proxies| Nodes
+    S1 <-->|mTLS encrypted| S2
+    S2 <-->|mTLS encrypted| S3
+```
 
 A service mesh has two distinct parts:
 
@@ -141,6 +168,11 @@ Once all traffic goes through the mesh, the mesh can make routing decisions base
 
 This is done entirely in the mesh configuration — **zero code changes** to the services themselves.
 
+| Approach | Use when… | Don't use when… |
+|----------|-----------|-----------------|
+| **Canary** (gradual % shift) | You want to test a new version on real traffic; you need fine-grained rollout control (1%, 10%, 50%, 100%) | You need instant rollback to a known-good state; the old and new versions are incompatible (e.g., schema changes) |
+| **Blue-Green** (full swap) | You need instant switch-over between two complete environments; old and new versions are fully deployed side-by-side | You want gradual traffic testing; the full environment is too expensive to duplicate |
+
 ---
 
 ## 9. Circuit Breaking: Protecting Yourself from Slow Dependencies
@@ -155,25 +187,56 @@ This protects:
 
 ---
 
+> **✏️ Check Your Understanding**
+> 1. You deploy a new microservice but it cannot reach the database service. Both services are running. What component is most likely misconfigured or unavailable?
+> 2. Your service mesh is running, but you notice that two unauthorized services can still communicate directly. What security feature is likely not enabled?
+> 3. During a traffic spike, Service B becomes slow and Service A starts timing out. Service A keeps retrying, making Service B even slower. What pattern should be in place between them?
+> <details>
+> <summary>Answers</summary>
+> 1. **Service registry or DNS.** The new service cannot find the database service's address. Check whether the registry (e.g., Consul, Kubernetes DNS) has the database service registered and whether the new service is querying the right endpoint.
+> 2. **mTLS.** Without mutual TLS, any service can impersonate another. In a mesh, mTLS should be enforced to require valid certificates from every caller.
+> 3. **Circuit breaker.** A circuit breaker would detect the failures and stop sending traffic to Service B after a threshold, giving it time to recover and preventing cascading failures.
+> </details>
+
+---
+
 ## 10. Common Disasters and How to Avoid Them
 
 ### Control Plane Goes Down
 
-If the control plane fails, the data plane proxies continue running with their last known configuration. The mesh is designed for **availability**: proxies cache their routing rules and keep working. However, you cannot make configuration changes until the control plane recovers.
+**Symptom:** You cannot update routing rules, deploy new services, or rotate certificates. Existing traffic continues flowing but changes are blocked.
 
-**Mitigation:** Run the control plane as a highly available replicated set.
+**Root Cause:** The control plane is a single point of failure for configuration. If it crashes or becomes unreachable, the data plane proxies operate on cached rules and cannot accept updates.
+
+**Real Incident:** In 2020, a major US bank experienced a multi-hour outage during a service mesh migration. A misconfigured control plane certificate expired, preventing any new services from joining the mesh. Existing services continued working, but the deployment pipeline was frozen.
+
+**Fix:** Run the control plane as a highly available replicated set with at least three replicas across availability zones. Use PodDisruptionBudgets to prevent all replicas from going down during updates.
+
+**How to Detect Early:** Monitor control plane leader election and API server response times. Alert if the control plane is unreachable for more than 30 seconds.
 
 ### The Performance "Hop Tax"
 
-Every request in a mesh goes through two sidecar proxies (the caller's and the receiver's). Each extra network hop adds latency. In a deep call chain (Service A → B → C → D), this can accumulate.
+**Symptom:** End-to-end latency increases noticeably after adding a service mesh. Deep call chains (Service A → B → C → D) show the most degradation.
 
-**Mitigation:** Measure the overhead. For most systems, the added latency (microseconds to low milliseconds) is worth the security and observability benefits. For ultra-low-latency systems, you may bypass the mesh for specific paths.
+**Root Cause:** Every request in a mesh goes through two sidecar proxies (the caller's and the receiver's). Each proxy adds microseconds of processing for routing, encryption, and metrics. In a deep chain with 5 services, this means 10 proxy hops.
+
+**Real Incident:** A large e-commerce company measured 15ms added latency per proxy hop in their mesh. For a checkout flow touching 8 services, this added 120ms — enough to trigger their p99 alert. They optimized by moving latency-critical paths to direct connections.
+
+**Fix:** Measure the overhead. For most systems, the added latency (microseconds to low milliseconds) is worth the security and observability benefits. For ultra-low-latency paths, allow direct connections that bypass the mesh sidecars.
+
+**How to Detect Early:** Compare p99 latency before and after mesh adoption for the same traffic patterns. Monitor sidecar proxy CPU — high utilization correlates with added latency.
 
 ### Graceful Draining
 
-When a service is shutting down, it must stop accepting new requests before actually closing. If the shutdown is too fast, active requests are dropped. If too slow, the service may be killed before the drain completes.
+**Symptom:** During rolling deployments or scale-down events, a small percentage of requests fail with "connection refused" or time out.
 
-**Mitigation:** Configure the drain timeout properly. The proxy deregisters the instance from the registry, waits for in-flight requests to complete (with a timeout), then shuts down.
+**Root Cause:** When a service is shut down, it must stop accepting new requests before closing connections. If the shutdown signal arrives and the process exits immediately, in-flight requests are dropped. The proxy deregisters the instance, but existing connections are abruptly terminated.
+
+**Real Incident:** A streaming service's rolling update caused 0.1% of video playback failures because the old pods were terminated while still serving active streams. Each terminated stream caused a buffering spike for the viewer.
+
+**Fix:** Configure the drain timeout properly. The proxy deregisters the instance from the registry, waits for in-flight requests to complete (with a configurable timeout), then shuts down. Set the termination grace period longer than the maximum expected request duration.
+
+**How to Detect Early:** Monitor connection-dropped metrics on the sidecar proxy. Alert if any connections are terminated during shutdown (non-zero pre-stop hook failures).
 
 ---
 
@@ -196,32 +259,42 @@ All of this happens without changing a single line of application code. The mesh
 
 ---
 
+> **🧪 Conceptual Exercises**
+> 1. Your team deploys a new version of the payment service alongside the old one. You want to send 5% of traffic to the new version and monitor for errors before rolling out fully. Your application code cannot be changed. How would you achieve this using a service mesh?
+> 2. Service A calls Service B, which calls Service C. Service C becomes slow and starts timing out. Without a circuit breaker, what happens to Service A? How would a circuit breaker change the outcome? What about Service B's threads?
+> <details>
+> <summary>Hints</summary>
+> For question 1, think about traffic splitting rules in the mesh control plane — no code changes needed. For question 2, trace the failure propagation: slow C → queued B threads → queued A threads → cascading timeout. The circuit breaker sits between A and B (or B and C) and fails fast before queues build up.
+> </details>
+
+---
+
 ## 12. Glossary of Technical Terms
 
-| Term | Definition |
-|------|------------|
-| **Canary Deployment** | Rolling out a new version to a small percentage of traffic first to test before full release. |
-| **Certificate Authority (CA)** | A trusted entity that issues digital certificates, verifying the identity of services in the mesh. |
-| **Circuit Breaker** | A pattern that stops requests to a failing service after a threshold, giving it time to recover. |
-| **Client-Side Discovery** | The client queries a service registry directly to find the address of a dependency. |
-| **Control Plane** | The central brain of a service mesh that manages certificates, routing rules, and configuration. |
-| **Data Plane** | The distributed proxies that handle every network packet between services. |
-| **DNS (Domain Name System)** | The phonebook of the internet — translates names to IP addresses. |
-| **Envoy** | A high-performance proxy commonly used as a sidecar in service meshes. |
-| **Graceful Drain** | The process of letting in-flight requests complete before shutting down a service. |
-| **Health Check** | An external probe that verifies a service is actually capable of serving traffic. |
-| **Hop Tax** | The added latency from traffic going through extra network hops (sidecar proxies). |
-| **iptables** | A Linux firewall tool used by meshes to transparently redirect traffic through the sidecar. |
-| **Istio** | A popular open-source service mesh platform. |
-| **Load Balancer** | A device or software that distributes incoming traffic across multiple servers. |
-| **mTLS (Mutual TLS)** | A security protocol where both client and server verify each other's identity. |
-| **Proxy** | An intermediary that forwards requests on behalf of a client. |
-| **Server-Side Discovery** | The client sends requests to a fixed load balancer, which resolves the target internally. |
-| **Service Mesh** | An infrastructure layer for managing service-to-service communication via sidecar proxies. |
-| **Service Registry** | A live directory of all running service instances and their addresses. |
-| **Sidecar Proxy** | A helper process that runs alongside a service and handles its network communication. |
-| **SPIFFE** | A standard for service identity in dynamic environments (used by many meshes). |
-| **Traffic Splitting** | Distributing traffic across multiple versions of a service for canary or blue-green deployments. |
+| Term | Definition | Section |
+|------|------------|---------|
+| **Service Registry** | A live directory of all running service instances and their addresses. | 1 |
+| **Client-Side Discovery** | The client queries a service registry directly to find the address of a dependency. | 2 |
+| **Server-Side Discovery** | The client sends requests to a fixed load balancer, which resolves the target internally. | 2 |
+| **DNS (Domain Name System)** | The phonebook of the internet — translates names to IP addresses. | 2 |
+| **Load Balancer** | A device or software that distributes incoming traffic across multiple servers. | 2 |
+| **Health Check** | An external probe that verifies a service is actually capable of serving traffic. | 3 |
+| **Service Mesh** | An infrastructure layer for managing service-to-service communication via sidecar proxies. | 4 |
+| **Sidecar Proxy** | A helper process that runs alongside a service and handles its network communication. | 4 |
+| **Proxy** | An intermediary that forwards requests on behalf of a client. | 4 |
+| **Control Plane** | The central brain of a service mesh that manages certificates, routing rules, and configuration. | 5 |
+| **Data Plane** | The distributed proxies that handle every network packet between services. | 5 |
+| **Envoy** | A high-performance proxy commonly used as a sidecar in service meshes. | 6 |
+| **iptables** | A Linux firewall tool used by meshes to transparently redirect traffic through the sidecar. | 6 |
+| **Istio** | A popular open-source service mesh platform. | 6 |
+| **mTLS (Mutual TLS)** | A security protocol where both client and server verify each other's identity. | 7 |
+| **Certificate Authority (CA)** | A trusted entity that issues digital certificates, verifying the identity of services in the mesh. | 7 |
+| **SPIFFE** | A standard for service identity in dynamic environments (used by many meshes). | 7 |
+| **Canary Deployment** | Rolling out a new version to a small percentage of traffic first to test before full release. | 8 |
+| **Traffic Splitting** | Distributing traffic across multiple versions of a service for canary or blue-green deployments. | 8 |
+| **Circuit Breaker** | A pattern that stops requests to a failing service after a threshold, giving it time to recover. | 9 |
+| **Graceful Drain** | The process of letting in-flight requests complete before shutting down a service. | 10 |
+| **Hop Tax** | The added latency from traffic going through extra network hops (sidecar proxies). | 10 |
 
 ---
 
@@ -244,4 +317,5 @@ All of this happens without changing a single line of application code. The mesh
 
 > This guide explains the "why" behind service discovery and service mesh patterns.
 > Once you're comfortable with these concepts, the original module (with its code templates, mTLS handshake deep dive, and Netflix migration case study) will serve as your in-depth reference.
+> For a deep-dive into xDS protocol, iptables interception mechanics, canary routing configuration, and control plane partition failure modes, read the [advanced companion file](06-service-mesh-advanced.md) — written from a Principal Infrastructure Engineer's perspective.
 > Remember: a good mesh makes your infrastructure smarter so your application code can stay simple.
