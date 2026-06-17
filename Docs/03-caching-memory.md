@@ -8,7 +8,7 @@
 
 > This guide explains what caching is, why it’s crucial at scale, and how to avoid the disasters that happen when caches break.
 > Every technical term is defined the first time it appears, and a full Glossary is at the end.
-> Once you understand these foundations, the original advanced module will feel like a natural next step.
+> Once you understand the analogies here, the [advanced guide](03-caching-memory-advanced.md) will take you into runtime details and failure mechanics.
 
 ---
 
