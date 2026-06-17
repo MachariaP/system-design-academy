@@ -1,10 +1,18 @@
 # Authentication & Authorization – A Beginner's Guide
 
+You've used this every time you clicked "Sign in with Google" instead of creating yet another username and password. That single button triggers a cascade of authentication (proving who you are) and authorization (deciding what you can do) — all without the website ever seeing your Google password.
+
+You've also felt the pain when it goes wrong. Ever been logged out of a site in the middle of a purchase? Or seen "Access denied" on a page you should have access to? Those are authentication and authorization failures — the system either didn't recognize you or didn't trust what you were allowed to do.
+
+Auth is the security perimeter of the digital world. Every API call, every page load, every service-to-service request must answer two questions: "Who is this?" and "Should they be allowed?" This module explains how modern systems answer both questions securely and at scale.
+
 > This guide explains how systems verify who you are (authentication) and what you are allowed to do (authorization) in a distributed, API-driven world.
 > Every technical term is defined the first time it appears, and a full Glossary is at the end.
 > Once you understand these foundations, the original advanced module will feel like a natural next step.
 
 ---
+
+> **Before you start:** You should understand [Module 1: Traffic Routing](../Docs/01-traffic-routing.md). If you haven't read those yet, start there.
 
 ## Table of Contents
 
@@ -19,6 +27,13 @@
 9. [Putting It All Together — A User Logs In](#9-putting-it-all-together--a-user-logs-in)
 10. [Glossary of Technical Terms](#10-glossary-of-technical-terms)
 11. [Key Takeaways](#11-key-takeaways)
+
+---
+
+> **⏱ TL;DR — If you only learn 3 things from this module:**
+> 1. **AuthN first, then AuthZ** — always verify who the user is before checking what they can do. They are two separate steps, not one.
+> 2. **JWTs are stateless and scalable but cannot be revoked** — use short TTLs (15 minutes) and refresh tokens. For instant revocation, use stateful sessions.
+> 3. **Never roll your own crypto** — use standard protocols (OAuth 2.0, OIDC, mTLS) and well-vetted libraries. Algorithm confusion and `alg: none` attacks are real and catastrophic.
 
 ---
 
@@ -77,13 +92,10 @@ A system must always do **AuthN first**, then **AuthZ**. There is no point check
 - **Cannot be revoked.** If a JWT is stolen, it is valid until it expires (unless you maintain a denylist, which defeats the stateless purpose).
 - **Token size** is larger than a session ID.
 
-| Feature | Session (Stateful) | JWT (Stateless) |
-|---------|-------------------|-----------------|
-| Server storage | Yes, per-session | None |
-| Scalability | Need shared session store | Horizontally scalable out of the box |
-| Revocation | Instant (delete session) | Impossible before TTL (without denylist) |
-| Complexity | Low | Medium (key management) |
-| Best for | Monoliths, traditional web apps | APIs, microservices, distributed systems |
+| Approach | Use when… | Don't use when… |
+|---------|-----------|-----------------|
+| **Stateful Sessions** | You need instant revocation; your app is a monolith or traditional web app; you have a small number of servers or a shared session store (Redis) | You need horizontal scalability without a shared store; your services are distributed across many regions |
+| **Stateless JWTs** | You have microservices or APIs that need to verify tokens without calling a central database; you need horizontal scalability out of the box | You need to revoke tokens instantly; you cannot tolerate the risk of stolen tokens being valid until TTL expiry |
 
 ---
 
@@ -132,6 +144,11 @@ OAuth 2.0 is a protocol that allows a user to grant a third-party application li
 
 In practice, OIDC gives you an **ID Token** (a JWT) containing the user's identity, while OAuth 2.0 gives you an **Access Token** (opaque or JWT) used to call APIs.
 
+| Protocol | Use when… | Don't use when… |
+|----------|-----------|-----------------|
+| **OAuth 2.0** | You need to grant a third-party app limited access to a user's resources (e.g., "let this app read my calendar"); you need delegated authorization | You only need to verify who the user is (authentication); you need identity information in the token itself |
+| **OIDC** | You need to verify a user's identity via a third-party provider (e.g., "Sign in with Google"); you need standardized identity claims (name, email, profile) in a JWT | You only need to authorize API access without identity verification; the overhead of the OIDC flow is unnecessary |
+
 ---
 
 ## 7. Service-to-Service Security with mTLS
@@ -150,35 +167,93 @@ This means **only authorized services can communicate**. If an attacker deploys 
 
 ---
 
+> **✏️ Check Your Understanding**
+> 1. Your API server receives a JWT with `"alg": "none"` and no signature. Should it accept it? What should your server do instead?
+> 2. A user is banned from your platform, but their JWT is still valid for 12 hours. You cannot afford to wait. How do you revoke access immediately without losing the benefits of stateless tokens entirely?
+> 3. Your auth server uses RS256 (asymmetric). An attacker changes the algorithm in the JWT header to HS256 and uses your server's public key (which is published via JWKS) to forge a valid token. What went wrong in your verification logic?
+> <details>
+> <summary>Answers</summary>
+> 1. **Never accept `alg: none`.** Always hardcode the allowed algorithms on the server. Reject any token that uses a non-whitelisted algorithm, especially "none."
+> 2. **Use short TTLs (15 min) with a revocable refresh token.** The access token expires quickly. The refresh token can be revoked server-side (it requires a database lookup when exchanged). Combine this with a short-lived denylist (in Redis) for the most critical accounts.
+> 3. **Your verification logic allowed the client to specify the algorithm.** The server should hardcode the expected algorithm (RS256) and refuse to use any other, especially symmetric algorithms like HS256 when the server uses asymmetric keys.
+> </details>
+
+---
+
 ## 8. Common Disasters and How to Avoid Them
 
 ### The `alg: none` Attack
 
-An attacker creates a JWT with `"alg": "none"` in the header and removes the signature. Some JWT libraries would accept this as valid (no signature = always passes).
+**Symptom:** An attacker gains unauthorized access by sending a JWT with no signature. The server accepts it and grants access to protected resources.
 
-**Mitigation:** Always hardcode the allowed algorithms on the server. Never accept "none".
+**Root Cause:** The JWT library is configured to accept the algorithm specified in the token header. The attacker sets `"alg": "none"` and removes the signature. The library sees "no signature required" and passes the token as valid.
+
+**Real Incident:** In 2015, several popular JWT libraries were found vulnerable to this attack. Attackers could forge tokens for any user by simply removing the signature and setting `alg: none`. The vulnerability affected applications using `jsonwebtoken`, `pyjwt`, and many other libraries.
+
+**Fix:** Always hardcode the allowed algorithms on the server. Never read the algorithm from the token header without validating it against a whitelist. Reject any token that uses a non-whitelisted algorithm, especially "none."
+
+**How to Detect Early:** Monitor for tokens with unexpected algorithms in your API gateway logs. Set up an alert if any request contains a JWT with `alg` set to `none` or any algorithm not in your whitelist.
 
 ### Algorithm Confusion
 
-The server uses RS256 (asymmetric: private key signs, public key verifies). The attacker changes the algorithm to HS256 (symmetric: same key signs and verifies) and uses the server's **public key** (which is public!) as the HMAC secret to forge a valid token.
+**Symptom:** An attacker forges valid JWTs using your server's public key. The tokens pass signature verification and grant unauthorized access.
 
-**Mitigation:** Do not use the same verification function for asymmetric and symmetric algorithms. Hardcode the algorithm.
+**Root Cause:** The server uses RS256 (asymmetric: private key signs, public key verifies). The attacker changes the algorithm to HS256 (symmetric: same key signs and verifies). If the verification code does not check whether the algorithm is asymmetric or symmetric, it uses the public key (which is public!) as the HMAC secret to verify the forged token — and it passes.
+
+**Real Incident:** Several enterprise SSO implementations were found vulnerable to this attack in 2018. Attackers could forge admin-level tokens by simply changing the algorithm field. The fix required updating JWT libraries and verification logic across thousands of integrations.
+
+**Fix:** Do not use the same verification function for asymmetric and symmetric algorithms. Hardcode the expected algorithm on the server. Use separate code paths for RS256 (asymmetric) and HS256 (symmetric). Better yet, only support asymmetric algorithms in production.
+
+**How to Detect Early:** Log the algorithm used in every JWT verification. Alert if a token using HS256 is received by a server that only publishes RS256 public keys.
 
 ### Token Revocation
 
-A user is banned, but their JWT is valid for another 24 hours. There is no way to revoke it without a denylist, which defeats the stateless purpose.
+**Symptom:** A user is banned, terminated, or their account is compromised, but they continue to access APIs for hours. The JWT is still within its validity period.
 
-**Mitigation:** Use short TTLs (15 minutes) with refresh tokens. The refresh token can be revoked because it requires a server call to exchange for a new access token.
+**Root Cause:** JWTs are stateless — once issued, they cannot be revoked without a server-side denylist. If the token has a long TTL (e.g., 24 hours), the window for unauthorized access is large.
+
+**Real Incident:** In 2019, a SaaS company terminated an employee but the employee's JWT-based API access remained active for 18 hours because the token's TTL was set to 24 hours. The employee downloaded sensitive customer data before the token expired.
+
+**Fix:** Use short TTLs (15 minutes) with refresh tokens. The refresh token can be revoked server-side (it requires a database lookup when exchanged for a new access token). For critical accounts, maintain a short-lived denylist (in Redis with a TTL matching the access token lifetime) that is checked on every request.
+
+**How to Detect Early:** Monitor for tokens being used after account status changes. Alert if a disabled account's tokens are still being accepted. Track the average time between account ban and token expiry.
 
 ### Clock Skew
 
-The JWT says it expired at 14:00:00 UTC, but the verifying server's clock is 30 seconds behind. The server thinks the token is still valid when it is not.
+**Symptom:** Valid JWTs are rejected, or expired JWTs are accepted. Users are randomly logged out, or attackers can use expired tokens.
 
-**Mitigation:** Always add a small leeway (30-60 seconds) to the expiration check.
+**Root Cause:** The JWT's `exp` (expiration) claim is checked against the server's clock. If the issuing server and verifying server have different clock times (even by seconds), a token may appear expired or not-yet-valid.
+
+**Real Incident:** A financial API provider experienced a 47-minute outage when one of their auth servers drifted 90 seconds ahead of the others. Tokens issued by the drifted server were rejected by verifying servers for being "issued in the future." The fix required adding NTP synchronization and a 60-second leeway.
+
+**Fix:** Always add a small leeway (30-60 seconds) to both the `exp` (expiration) and `nbf` (not before) checks. Ensure all servers use NTP for clock synchronization. Use the `iat` (issued at) claim to detect tokens that were issued significantly in the future.
+
+**How to Detect Early:** Monitor clock skew between servers using NTP. Alert if any server's clock drifts by more than 5 seconds from the reference. Track JWT verification failures caused by `exp` or `nbf` claims and alert if they spike.
 
 ---
 
 ## 9. Putting It All Together — A User Logs In
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as Mobile App
+    participant Auth as Google Auth
+    participant API as Your Backend
+
+    U->>App: Click "Sign in with Google"
+    App->>Auth: Redirect with PKCE challenge
+    U->>Auth: Authenticate & consent
+    Auth->>App: Authorization code
+    App->>Auth: Exchange code + verifier
+    Auth->>App: ID Token + Access Token
+    App->>API: Send ID Token
+    API->>API: Verify JWT signature (JWKS)
+    API->>App: Internal JWT (15 min TTL)
+    App->>API: API call with Internal JWT
+    API->>API: Verify & process
+    API->>App: Response
+```
 
 Let's trace a user logging into a mobile app using "Sign in with Google":
 
@@ -195,30 +270,40 @@ The user's password was never shared with the app. The app's backend never neede
 
 ---
 
+> **🧪 Conceptual Exercises**
+> 1. Your mobile app uses JWTs for authentication. A user's phone is stolen. The JWT has a 24-hour TTL. How do you prevent the thief from accessing the user's data for the next 24 hours? What trade-offs does your solution involve?
+> 2. Your backend calls an external payment API. The payment API requires a client certificate to authenticate your service. Which protocol would you use, and how would you manage certificate expiry without causing a production outage?
+> <details>
+> <summary>Hints</summary>
+> For question 1, consider refresh tokens and a denylist — the refresh token can be revoked server-side, and stolen access tokens can be checked against a short-lived denylist (at the cost of losing full statelessness). Short TTLs limit the damage window. For question 2, this is mTLS — your service needs a certificate signed by the payment provider's CA. Use a certificate management tool (like cert-manager) to auto-renew before expiry, and set up monitoring on certificate expiry dates.
+> </details>
+
+---
+
 ## 10. Glossary of Technical Terms
 
-| Term | Definition |
-|------|------------|
-| **Access Token** | A token that grants access to specific resources or APIs (OAuth 2.0). |
-| **AuthN (Authentication)** | The process of verifying who a user is. |
-| **AuthZ (Authorization)** | The process of determining what a user is allowed to do. |
-| **Certificate Authority (CA)** | A trusted entity that issues digital certificates. |
-| **Clock Skew** | The time difference between the clocks of two systems. |
-| **DPoP (Demonstration of Proof-of-Possession)** | A technique to bind a token to a specific client, preventing stolen-token reuse. |
-| **ID Token** | A JWT that contains the user's identity (OIDC). |
-| **JWT (JSON Web Token)** | A compact, self-contained, cryptographically-signed token for transmitting identity and claims. |
-| **JWKS (JSON Web Key Set)** | A set of public keys published by an authorization server for JWT verification. |
-| **mTLS (Mutual TLS)** | A security protocol where both client and server verify each other's certificates. |
-| **OAuth 2.0** | A protocol for delegated authorization — granting limited access without sharing passwords. |
-| **OIDC (OpenID Connect)** | An identity layer on top of OAuth 2.0 for authentication. |
-| **PKCE** | Proof Key for Code Exchange — protects OAuth flows on mobile and public clients. |
-| **Private Key** | A secret key used to sign JWTs. Only the issuer knows it. |
-| **Public Key** | A key published openly that anyone can use to verify a JWT signature. |
-| **Refresh Token** | A long-lived token used to obtain new access tokens without re-authentication. |
-| **RS256** | An asymmetric signing algorithm (RSA with SHA-256) — private key signs, public key verifies. |
-| **Session** | A server-side record of an authenticated user, stored in a database or cache. |
-| **Stateless** | The server does not store any client state between requests. |
-| **Token Revocation** | Invalidating a token before its natural expiration. Difficult with stateless JWTs. |
+| Term | Definition | Section |
+|------|------------|---------|
+| **AuthN (Authentication)** | The process of verifying who a user is. | 1 |
+| **AuthZ (Authorization)** | The process of determining what a user is allowed to do. | 1 |
+| **Session** | A server-side record of an authenticated user, stored in a database or cache. | 2 |
+| **Stateless** | The server does not store any client state between requests. | 3 |
+| **JWT (JSON Web Token)** | A compact, self-contained, cryptographically-signed token for transmitting identity and claims. | 3 |
+| **Public Key** | A key published openly that anyone can use to verify a JWT signature. | 4 |
+| **Private Key** | A secret key used to sign JWTs. Only the issuer knows it. | 4 |
+| **RS256** | An asymmetric signing algorithm (RSA with SHA-256) — private key signs, public key verifies. | 4 |
+| **JWKS (JSON Web Key Set)** | A set of public keys published by an authorization server for JWT verification. | 4 |
+| **OAuth 2.0** | A protocol for delegated authorization — granting limited access without sharing passwords. | 5 |
+| **Access Token** | A token that grants access to specific resources or APIs (OAuth 2.0). | 5 |
+| **Refresh Token** | A long-lived token used to obtain new access tokens without re-authentication. | 5 |
+| **PKCE** | Proof Key for Code Exchange — protects OAuth flows on mobile and public clients. | 5 |
+| **DPoP (Demonstration of Proof-of-Possession)** | A technique to bind a token to a specific client, preventing stolen-token reuse. | 5 |
+| **OIDC (OpenID Connect)** | An identity layer on top of OAuth 2.0 for authentication. | 6 |
+| **ID Token** | A JWT that contains the user's identity (OIDC). | 6 |
+| **mTLS (Mutual TLS)** | A security protocol where both client and server verify each other's certificates. | 7 |
+| **Certificate Authority (CA)** | A trusted entity that issues digital certificates. | 7 |
+| **Token Revocation** | Invalidating a token before its natural expiration. Difficult with stateless JWTs. | 8 |
+| **Clock Skew** | The time difference between the clocks of two systems. | 8 |
 
 ---
 
@@ -241,4 +326,5 @@ The user's password was never shared with the app. The app's backend never neede
 
 > This guide explains the "why" behind authentication and authorization patterns.
 > Once you're comfortable with these concepts, the original module (with its JWT validation code, OAuth 2.0 flow diagrams, and mTLS handshake deep dive) will serve as your in-depth reference.
+> For a deep-dive into PKCE internals, DPoP replay protection, JWKS rotation mechanics, and multi-AS mix-up attacks, read the [advanced companion file](08-security-auth-advanced.md) — written from a Principal Security Architect's perspective.
 > Remember: in a zero-trust world, identity is the new perimeter. Every request must be verified, regardless of where it comes from.
