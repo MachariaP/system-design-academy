@@ -59,7 +59,9 @@ System Design Academy is a professional, open-source curriculum for engineers wh
 | 13 | [Back-of-the-Envelope Estimation](modules/13-capacity-planning.md) | Latency numbers, power-of-two rules, QPS/storage/bandwidth estimation, peak multipliers, and worked exercises |
 | 14 | [System Design Interview Framework](modules/14-interview-framework.md) | 4-phase whiteboard roadmap, seniority signaling, defensive whiteboarding, mock interview walkthroughs, and a 10-problem question bank |
 
-Each module has a companion **beginner-friendly guide** in the [`Docs/`](Docs/) directory that explains the same concepts using plain language, everyday analogies, and a full glossary — perfect for warming up before the deep dive. Read the beginner guide first, then the advanced module for production-grade depth.
+Each module has **two companion guides** in the [`Docs/`](Docs/) directory:
+- 🟢 **Beginner guide** (`XX-module-name.md`) — plain language, everyday analogies, full glossary. Start here.
+- 🔴 **Advanced guide** (`XX-module-name-advanced.md`) — FAANG Principal Engineer deep-dive with paper references, failure modes, and teacher's corner with grading rubrics. Level up here.
 
 ### Real-World System Design Blueprints
 
